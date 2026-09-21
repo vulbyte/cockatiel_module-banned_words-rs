@@ -1,0 +1,54 @@
+{
+  "name": "banned-words",
+  "description": "preprocess module that detects and censors banned words (no-spaces, leet, extra-spaces) and can flag messages for review",
+  "version": "0.1.0",
+  "capabilities": "preprocess",
+  "root_file": "./src/main.rs",
+  "launch_command": "cargo run",
+  "command_flags": [
+    "--release"
+  ],
+  "autostart": true,
+  "credentials": [
+    {
+      "key": "banned_words",
+      "label": "Banned Words",
+      "sensitive": false,
+      "list": true
+    },
+    {
+      "key": "censor_mode",
+      "label": "Censor Mode (soft/mid/hard/replace/flag)",
+      "sensitive": false,
+      "list": false
+    },
+    {
+      "key": "replace_word",
+      "label": "Replacement Word",
+      "sensitive": false,
+      "list": false
+    }
+  ],
+  "binary": {
+    "macos": {
+      "x86_64": "target/release/banned_words_rs",
+      "aarch64": "target/release/banned_words_rs",
+      "arm": "target/release/banned_words_rs"
+    },
+    "linux": {
+      "x86_64": "target/release/banned_words_rs",
+      "aarch64": "target/release/banned_words_rs",
+      "arm": "target/release/banned_words_rs"
+    },
+    "windows": {
+      "x86_64": "target/release/banned_words_rs.exe",
+      "aarch64": "target/release/banned_words_rs.exe",
+      "arm": "target/release/banned_words_rs.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ]
+}

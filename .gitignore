@@ -1,0 +1,9 @@
+/target/
+config.json
+.env
+.env.local
+banned_words.json
+*.db
+*.log
+.DS_Store
+__pycache__/
