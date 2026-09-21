@@ -249,6 +249,31 @@ async fn prompt_for_input(
     None
 }
 
+/// Read the Config from config.json. Prefers the `module_specific` object
+/// (where the engine/TUI store credential settings); falls back to the legacy
+/// top-level layout so pre-existing configs keep working.
+fn read_config_from_file() -> Option<Config> {
+    let s = std::fs::read_to_string("config.json").ok()?;
+    let root: serde_json::Value = serde_json::from_str(&s).ok()?;
+    match root.get("module_specific") {
+        Some(ms) if ms.is_object() => serde_json::from_value::<Config>(ms.clone()).ok(),
+        _ => serde_json::from_str::<Config>(&s).ok(),
+    }
+}
+
+/// Save the Config into the `module_specific` object of config.json, merging
+/// with (and preserving) any existing top-level fields such as ip/port/pin.
+fn save_config(config: &Config) {
+    let mut root: serde_json::Value = std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    root["module_specific"] = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
+    if let Ok(pretty) = serde_json::to_string_pretty(&root) {
+        let _ = std::fs::write("config.json", pretty);
+    }
+}
+
 fn default_config() -> Config {
     Config {
         banned_words: vec!["cheese".to_string(), "badword".to_string()],
@@ -267,10 +292,11 @@ async fn load_config(
     module_name: &str,
     instance_uuid: &str,
 ) -> Config {
-    if let Ok(s) = std::fs::read_to_string("config.json") {
-        if let Ok(cfg) = serde_json::from_str(&s) {
-            return cfg;
-        }
+    if let Some(cfg) = read_config_from_file() {
+        // A legacy top-level config is migrated into module_specific here so
+        // the engine's stored credentials and this module stay in sync.
+        save_config(&cfg);
+        return cfg;
     }
 
     // No saved config: ask the operator via the engine prompt subwindow
@@ -326,9 +352,7 @@ async fn load_config(
         replace_sentence: String::new(),
     };
 
-    if let Ok(pretty) = serde_json::to_string_pretty(&config) {
-        let _ = std::fs::write("config.json", pretty);
-    }
+    save_config(&config);
     config
 }
 
