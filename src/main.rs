@@ -505,3 +505,63 @@ audio: Vec::new(),
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn banned() -> Vec<String> {
+        vec!["badword".to_string(), "shoot".to_string()]
+    }
+
+    #[test]
+    fn detects_exact_match() {
+        let (w, variant) = detect_banned("you are a badword", &banned()).unwrap();
+        assert_eq!(w, "badword");
+        assert_eq!(variant, "exact");
+    }
+
+    #[test]
+    fn detects_leet() {
+        assert!(detect_banned("b4dw0rd", &banned()).is_some());
+    }
+
+    #[test]
+    fn detects_no_spaces() {
+        assert!(detect_banned("b a d w o r d", &banned()).is_some());
+        assert!(detect_banned("b_a_d_w_o_r_d", &banned()).is_some());
+    }
+
+    #[test]
+    fn case_insensitive() {
+        let (w, _) = detect_banned("BADWORD", &banned()).unwrap();
+        assert_eq!(w, "badword");
+    }
+
+    #[test]
+    fn clean_message_is_none() {
+        assert!(detect_banned("hello friends", &banned()).is_none());
+    }
+
+    #[test]
+    fn censor_hard_stars_everything() {
+        assert_eq!(censor_token("badword", "hard", ""), "*******");
+    }
+
+    #[test]
+    fn censor_soft_keeps_ends() {
+        assert_eq!(censor_token("badword", "soft", ""), "b*****d");
+        assert_eq!(censor_token("sh", "soft", ""), "**");
+    }
+
+    #[test]
+    fn censor_replace_uses_replace_word() {
+        assert_eq!(censor_token("badword", "replace", "heck"), "heck");
+        assert_eq!(censor_token("badword", "replace", ""), "*******");
+    }
+
+    #[test]
+    fn censor_message_censors_matching_tokens_only() {
+        let out = censor_message("badword is a word", &banned(), "hard", "");
+        assert_eq!(out, "******* is a word");
+    }
+}
