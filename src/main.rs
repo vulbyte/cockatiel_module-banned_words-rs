@@ -561,6 +561,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let Ok(container) = Container::decode(data.as_ref()) else { continue };
 
                 match container.payload {
+                    Some(Payload::AuthVerify(_)) => {
+                        // Answer the engine's liveness probe (this module reads
+                        // the socket directly, so the client's auto-answer is
+                        // bypassed — without this the watchdog severs us).
+                        let reply = Container {
+                            version: 1,
+                            auth_token: auth_token.clone(),
+                            module_name: module_name.clone(),
+                            module_instance_uuid7: instance_uuid.clone(),
+                            payload: Some(Payload::AuthVerify(AuthVerify {
+                                cur_auth: auth_token.clone(),
+                            })),
+                        };
+                        let mut buf = Vec::new();
+                        if reply.encode(&mut buf).is_ok() {
+                            let mut w = write_shared.lock().await;
+                            let _ = w.send(WsMessage::Binary(buf.into())).await;
+                        }
+                    }
                     Some(Payload::PromptResponse(resp)) => {
                         // Forward operator answers to the awaiting prompt.
                         let _ = prompt_tx_task.send(resp);
