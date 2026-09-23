@@ -2,14 +2,19 @@
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tracing::{info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient, PromptKind};
+use cockatiel_client::proto::container::Payload;
+use cockatiel_client::proto::*;
+use cockatiel_client::{CockatielClient, PromptKind};
 
 type WsWriteHalf = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<
@@ -34,6 +39,16 @@ struct Config {
     sentence_mode: String,
     #[serde(default)]
     replace_sentence: String,
+    /// Master switch for the optional LLM review. When off (default) the module
+    /// is purely the word-list detector/censor — no Python, no models.
+    #[serde(default)]
+    llm_review: bool,
+    /// The "risk certainty" (0–1): a review score >= this is treated as a hit.
+    #[serde(default = "default_review_threshold")]
+    llm_review_threshold: f64,
+    /// "deberta" (default) | "llama-guard" | "auto" — both optional.
+    #[serde(default = "default_review_engine")]
+    llm_review_engine: String,
 }
 
 fn default_mode() -> String {
@@ -42,6 +57,14 @@ fn default_mode() -> String {
 
 fn default_sentence_mode() -> String {
     "none".to_string()
+}
+
+fn default_review_threshold() -> f64 {
+    0.5
+}
+
+fn default_review_engine() -> String {
+    "deberta".to_string()
 }
 
 /// Leet-speak translation table (common substitutions).
@@ -177,6 +200,135 @@ fn censor_message(message: &str, banned: &[String], mode: &str, replace_word: &s
     result
 }
 
+/// Optional LLM review backend. Spawns `worker/review_worker.py` lazily (only
+/// when enabled), feeds it JSONL requests on stdin, reads the 0–1 risk back.
+/// A review that times out (slow model/load) yields None and the message is
+/// passed through unreviewed — the module never blocks the pipeline ack.
+struct ReviewWorker {
+    enabled: bool,
+    engine: String,
+    threshold: f64,
+    child: AsyncMutex<Option<ReviewChild>>,
+    dead: Arc<AtomicBool>,
+}
+
+struct ReviewChild {
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl ReviewWorker {
+    fn new(enabled: bool, engine: String, threshold: f64) -> Self {
+        Self {
+            enabled,
+            engine,
+            threshold,
+            child: AsyncMutex::new(None),
+            dead: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Score a message. None = disabled, worker failed to start, timed out, or
+    /// an error — the caller passes the message through unreviewed.
+    async fn review(&self, text: &str) -> Option<f64> {
+        if !self.enabled || self.dead.load(Ordering::SeqCst) {
+            return None;
+        }
+        let mut guard = self.child.lock().await;
+        if guard.is_none() {
+            match spawn_review_worker(&self.engine).await {
+                Ok(c) => *guard = Some(c),
+                Err(e) => {
+                    warn!("llm_review: worker failed to start ({}); disabling review", e);
+                    self.dead.store(true, Ordering::SeqCst);
+                    return None;
+                }
+            }
+        }
+        let child = guard.as_mut()?;
+        let req = serde_json::json!({ "text": text }).to_string();
+        if child.stdin.write_all(req.as_bytes()).await.is_err() || child.stdin.write_all(b"\n").await.is_err() {
+            self.dead.store(true, Ordering::SeqCst);
+            return None;
+        }
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_secs(2), child.stdout.read_line(&mut line)).await {
+            Ok(Ok(n)) if n > 0 => {
+                match serde_json::from_str::<serde_json::Value>(&line) {
+                    Ok(v) => {
+                        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                            // The worker is broken (model missing / HF-gated): warn
+                            // once + disable so we stop paying per-message timeouts.
+                            warn!("llm_review worker error ({}); disabling review", err);
+                            self.dead.store(true, Ordering::SeqCst);
+                            None
+                        } else {
+                            v.get("risk").and_then(|r| r.as_f64())
+                        }
+                    }
+                    Err(_) => None,
+                }
+            }
+            _ => None, // timeout or worker gone
+        }
+    }
+
+    /// Whether this text should be treated as a hit given the configurable
+    /// risk-certainty threshold.
+    fn is_hit(&self, risk: f64) -> bool {
+        risk >= self.threshold
+    }
+}
+
+async fn spawn_review_worker(engine: &str) -> Result<ReviewChild, Box<dyn std::error::Error>> {
+    let mut cmd = Command::new("python3");
+    cmd.arg("worker/review_worker.py")
+        .arg("--engine")
+        .arg(engine)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    let mut child = cmd.spawn()?;
+    let stdin = child.stdin.take().ok_or("no stdin")?;
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    Ok(ReviewChild { stdin, stdout: BufReader::new(stdout) })
+}
+
+/// Build the ChatMessageRejected record a module sends to the engine so the
+/// rejection is logged clearly (reason + original raw + processed).
+fn compose_rejected(
+    message_uuid7: &str,
+    chat: &ChatMessage,
+    processed: &str,
+    reason: &str,
+) -> ChatMessageRejected {
+    ChatMessageRejected {
+        message_uuid7: message_uuid7.to_string(),
+        message: Some(chat.clone()),
+        processed_message: processed.to_string(),
+        reason: reason.to_string(),
+        origin: "banned-words".to_string(),
+    }
+}
+
+/// Apply the configured censor (sentence or token mode) to a flagged message.
+fn apply_censor(config: &Config, original: &str) -> String {
+    match config.sentence_mode.as_str() {
+        // Censor the whole message/sentence.
+        "censor" => "*".repeat(original.chars().count()),
+        // Replace the whole message/sentence.
+        "replace" => {
+            if config.replace_sentence.is_empty() {
+                censor_message(original, &config.banned_words, &config.censor_mode, &config.replace_word)
+            } else {
+                config.replace_sentence.clone()
+            }
+        }
+        // Default: censor only the offending token(s).
+        _ => censor_message(original, &config.banned_words, &config.censor_mode, &config.replace_word),
+    }
+}
+
 /// Send a Prompt to the engine (forwarded to connected UIs) and wait for the
 /// operator's response (`PromptResponse.reason`). Returns None on cancel/timeout.
 async fn prompt_for_input(
@@ -282,6 +434,9 @@ fn default_config() -> Config {
         flag_for_review: false,
         sentence_mode: default_sentence_mode(),
         replace_sentence: String::new(),
+        llm_review: false,
+        llm_review_threshold: default_review_threshold(),
+        llm_review_engine: default_review_engine(),
     }
 }
 
@@ -350,6 +505,11 @@ async fn load_config(
         flag_for_review: false,
         sentence_mode: default_sentence_mode(),
         replace_sentence: String::new(),
+        // LLM review defaults off; the operator enables it + sets the
+        // risk-certainty threshold via the module's config (engine/TUI).
+        llm_review: default.llm_review,
+        llm_review_threshold: default.llm_review_threshold,
+        llm_review_engine: default.llm_review_engine,
     };
 
     save_config(&config);
@@ -381,12 +541,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the config prompt can receive its response), so it reads config from an
     // Arc<Mutex> that is populated right after load_config returns.
     let config_shared: Arc<Mutex<Config>> = Arc::new(Mutex::new(default_config()));
+    // Shared optional LLM reviewer — populated after load_config; the read task
+    // clones it per message so a disabled review never spawns anything.
+    let review_worker_shared: Arc<Mutex<Option<Arc<ReviewWorker>>>> = Arc::new(Mutex::new(None));
 
     // Read task: forward PromptResponses to the awaiting prompt AND handle
     // message pre-processing. Spawned BEFORE load_config so prompts work.
     {
         let prompt_tx_task = prompt_tx.clone();
         let config_shared = Arc::clone(&config_shared);
+        let review_worker_shared = Arc::clone(&review_worker_shared);
         let write_shared = Arc::clone(&write_shared);
         let auth_token = auth_token.clone();
         let module_name = module_name.clone();
@@ -406,42 +570,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let config = config_shared.lock().unwrap().clone();
                         let original = chat.raw_message.clone();
                         let uuid = pre.message_uuid7.clone();
+                        let worker = review_worker_shared.lock().unwrap().clone();
 
                         let mut flagged = false;
-                        let censored = match detect_banned(&original, &config.banned_words) {
+                        let mut reason = String::new();
+                        match detect_banned(&original, &config.banned_words) {
                             Some((word, variant)) => {
                                 warn!("Banned word '{}' detected via {} variant", word, variant);
                                 flagged = true;
-                                match config.sentence_mode.as_str() {
-                                    // Censor the whole message/sentence.
-                                    "censor" => "*".repeat(original.chars().count()),
-                                    // Replace the whole message/sentence.
-                                    "replace" => {
-                                        if config.replace_sentence.is_empty() {
-                                            censor_message(&original, &config.banned_words, &config.censor_mode, &config.replace_word)
-                                        } else {
-                                            config.replace_sentence.clone()
+                                reason = format!("banned word '{}' via {} variant", word, variant);
+                            }
+                            None if config.llm_review => {
+                                // Optional LLM review: catch what the word list
+                                // missed. Risk >= the configurable certainty
+                                // threshold is treated exactly like a word hit.
+                                if let Some(w) = &worker {
+                                    if let Some(risk) = w.review(&original).await {
+                                        if w.is_hit(risk) {
+                                            warn!("LLM review flagged message (risk={})", risk);
+                                            flagged = true;
+                                            reason = format!(
+                                                "LLM risk {} >= threshold {}",
+                                                risk, config.llm_review_threshold
+                                            );
                                         }
                                     }
-                                    // Default: censor only the offending token(s).
-                                    _ => censor_message(&original, &config.banned_words, &config.censor_mode, &config.replace_word),
                                 }
                             }
-                            None => original.clone(),
+                            _ => {}
+                        }
+
+                        let censored = if flagged {
+                            apply_censor(&config, &original)
+                        } else {
+                            original.clone()
                         };
 
-                        // If flag_for_review, send an Err/Log so the engine surfaces it.
+                        // If flag_for_review, send a ChatMessageRejected so the
+                        // engine logs the rejection clearly (reason + raw +
+                        // processed) instead of an obscure log string.
                         if flagged && config.flag_for_review {
+                            let rej = compose_rejected(&uuid, chat, &censored, &reason);
                             let log = Container {
                                 version: 1,
                                 auth_token: auth_token.clone(),
                                 module_name: module_name.clone(),
                                 module_instance_uuid7: instance_uuid.clone(),
-                                payload: Some(Payload::Err(cockatiel_client::proto::Err {
-                                    log: format!("[banned-words] flagged message for review: {}", original),
-                                    blob: vec![],
-                                    trace: String::new(),
-                                })),
+                                payload: Some(Payload::ChatMessageRejected(rej)),
                             };
                             let mut buf = Vec::new();
                             if log.encode(&mut buf).is_ok() {
@@ -495,10 +670,18 @@ audio: Vec::new(),
     )
     .await;
     *config_shared.lock().unwrap() = config.clone();
+    *review_worker_shared.lock().unwrap() = Some(Arc::new(ReviewWorker::new(
+        config.llm_review,
+        config.llm_review_engine.clone(),
+        config.llm_review_threshold,
+    )));
     info!(
-        "Banned-words module active: mode={}, {} word(s)",
+        "Banned-words module active: mode={}, {} word(s), llm_review={} (engine={}, threshold={})",
         config.censor_mode,
-        config.banned_words.len()
+        config.banned_words.len(),
+        config.llm_review,
+        config.llm_review_engine,
+        config.llm_review_threshold,
     );
 
     // Keep the process alive; the read task does all the work.
@@ -564,5 +747,80 @@ mod tests {
     fn censor_message_censors_matching_tokens_only() {
         let out = censor_message("badword is a word", &banned(), "hard", "");
         assert_eq!(out, "******* is a word");
+    }
+
+    fn cfg_with_review() -> Config {
+        Config {
+            llm_review: true,
+            llm_review_threshold: 0.5,
+            llm_review_engine: "deberta".to_string(),
+            ..default_config()
+        }
+    }
+
+    #[test]
+    fn llm_review_off_by_default() {
+        assert!(!default_config().llm_review);
+        assert_eq!(default_config().llm_review_threshold, 0.5);
+        assert_eq!(default_config().llm_review_engine, "deberta");
+    }
+
+    #[test]
+    fn threshold_hit_and_miss() {
+        let w = ReviewWorker::new(true, "deberta".to_string(), 0.5);
+        assert!(w.is_hit(0.9));
+        assert!(w.is_hit(0.5)); // >= threshold is a hit
+        assert!(!w.is_hit(0.3));
+        assert!(!w.is_hit(0.0));
+
+        let strict = ReviewWorker::new(true, "deberta".to_string(), 0.9);
+        assert!(!strict.is_hit(0.5));
+        assert!(strict.is_hit(0.95));
+    }
+
+    #[test]
+    fn disabled_worker_never_reviews() {
+        // A disabled worker is a no-op: review() returns None without spawning.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let w = ReviewWorker::new(false, "deberta".to_string(), 0.5);
+        let r = rt.block_on(w.review("anything"));
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn compose_rejected_carries_reason_raw_processed() {
+        let chat = ChatMessage {
+            platform: "twitch".into(),
+            raw_data: vec![],
+            raw_message: "b4dx".into(),
+            user_uuid7: "u1".into(),
+            command: None,
+            user_data: None,
+            channel_id: "chan".into(),
+        };
+        let rej = compose_rejected("uuid-9", &chat, "b*d*", "banned word 'x' via leet");
+        assert_eq!(rej.message_uuid7, "uuid-9");
+        assert_eq!(rej.origin, "banned-words");
+        assert_eq!(rej.reason, "banned word 'x' via leet");
+        assert_eq!(rej.processed_message, "b*d*");
+        let raw = rej.message.unwrap();
+        assert_eq!(raw.raw_message, "b4dx");
+        assert_eq!(raw.platform, "twitch");
+    }
+
+    #[test]
+    fn apply_censor_sentence_and_token_modes() {
+        let mut cfg = cfg_with_review();
+        cfg.sentence_mode = "censor".to_string();
+        assert_eq!(apply_censor(&cfg, "some badword here"), "*".repeat(17));
+
+        cfg.sentence_mode = "replace".to_string();
+        cfg.replace_sentence = "[removed]".to_string();
+        assert_eq!(apply_censor(&cfg, "some badword here"), "[removed]");
+
+        cfg.sentence_mode = "none".to_string();
+        cfg.replace_sentence = String::new();
+        cfg.censor_mode = "hard".to_string();
+        assert_eq!(apply_censor(&cfg, "badword is a word"), "******* is a word");
     }
 }

@@ -1,7 +1,7 @@
 {
   "name": "banned-words",
-  "description": "preprocess module that detects and censors banned words (no-spaces, leet, extra-spaces) and can flag messages for review",
-  "version": "0.1.0",
+  "description": "preprocess module that detects and censors banned words (no-spaces, leet, extra-spaces), optionally flags messages for review, and can run an optional LLM review (deberta/llama-guard) with a configurable risk threshold",
+  "version": "0.2.0",
   "capabilities": "preprocess",
   "root_file": "./src/main.rs",
   "launch_command": "cargo run",
@@ -26,6 +26,36 @@
       "key": "replace_word",
       "label": "Replacement Word",
       "sensitive": false,
+      "list": false
+    },
+    {
+      "key": "flag_for_review",
+      "label": "Flag flagged messages for review",
+      "sensitive": false,
+      "list": false
+    },
+    {
+      "key": "llm_review",
+      "label": "Optional LLM review (on/off)",
+      "sensitive": false,
+      "list": false
+    },
+    {
+      "key": "llm_review_threshold",
+      "label": "Risk certainty threshold (0-1)",
+      "sensitive": false,
+      "list": false
+    },
+    {
+      "key": "llm_review_engine",
+      "label": "Review engine (deberta/llama-guard/auto)",
+      "sensitive": false,
+      "list": false
+    },
+    {
+      "key": "huggingface_token",
+      "label": "HuggingFace token (for llama-guard)",
+      "sensitive": true,
       "list": false
     }
   ],
