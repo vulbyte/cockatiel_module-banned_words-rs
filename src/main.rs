@@ -49,6 +49,81 @@ struct Config {
     /// "deberta" (default) | "llama-guard" | "auto" — both optional.
     #[serde(default = "default_review_engine")]
     llm_review_engine: String,
+    /// Round-trip timeout for a single LLM review (request-write +
+    /// response-read), in seconds.
+    #[serde(default = "default_review_timeout_secs")]
+    review_timeout_secs: u64,
+    /// Interpreter used to launch the review worker.
+    #[serde(default = "default_python_interpreter")]
+    python_interpreter: String,
+    /// Path to the review worker script (relative to the module dir).
+    #[serde(default = "default_worker_script_path")]
+    worker_script_path: String,
+    /// Timeout (seconds) for the operator setup prompts shown when no
+    /// saved config exists.
+    #[serde(default = "default_prompt_timeout_secs")]
+    prompt_timeout_secs: u32,
+    /// Reconnect backoff floor (seconds) when the engine connection drops.
+    #[serde(default = "default_reconnect_base_secs")]
+    reconnect_base_secs: u64,
+    /// Reconnect backoff cap (seconds) after exponential growth.
+    #[serde(default = "default_reconnect_max_secs")]
+    reconnect_max_secs: u64,
+    /// Worker model overrides (defaults keep the built-in worker behavior).
+    #[serde(default = "default_llama_model")]
+    llama_model: String,
+    #[serde(default = "default_deberta_model")]
+    deberta_model: String,
+    #[serde(default = "default_deberta_max_length")]
+    deberta_max_length: u64,
+    #[serde(default = "default_llama_max_length")]
+    llama_max_length: u64,
+    #[serde(default = "default_llama_max_new_tokens")]
+    llama_max_new_tokens: u64,
+}
+
+fn default_review_timeout_secs() -> u64 {
+    10
+}
+
+fn default_python_interpreter() -> String {
+    "python3".to_string()
+}
+
+fn default_worker_script_path() -> String {
+    "worker/review_worker.py".to_string()
+}
+
+fn default_prompt_timeout_secs() -> u32 {
+    60
+}
+
+fn default_reconnect_base_secs() -> u64 {
+    1
+}
+
+fn default_reconnect_max_secs() -> u64 {
+    30
+}
+
+fn default_llama_model() -> String {
+    "meta-llama/Llama-Guard-3-1B".to_string()
+}
+
+fn default_deberta_model() -> String {
+    "microsoft/deberta-v3-small".to_string()
+}
+
+fn default_deberta_max_length() -> u64 {
+    256
+}
+
+fn default_llama_max_length() -> u64 {
+    2000
+}
+
+fn default_llama_max_new_tokens() -> u64 {
+    16
 }
 
 fn default_mode() -> String {
@@ -210,6 +285,14 @@ struct ReviewWorker {
     enabled: bool,
     engine: String,
     threshold: f64,
+    review_timeout_secs: u64,
+    python_interpreter: String,
+    worker_script_path: String,
+    llama_model: String,
+    deberta_model: String,
+    deberta_max_length: u64,
+    llama_max_length: u64,
+    llama_max_new_tokens: u64,
     child: AsyncMutex<Option<ReviewChild>>,
     dead: Arc<AtomicBool>,
 }
@@ -223,11 +306,21 @@ struct ReviewChild {
 }
 
 impl ReviewWorker {
-    fn new(enabled: bool, engine: String, threshold: f64) -> Self {
+    /// Settings (timeouts, interpreter, worker path, model overrides) are read
+    /// from the module Config so operators can tune them without editing code.
+    fn new(enabled: bool, engine: String, threshold: f64, cfg: &Config) -> Self {
         Self {
             enabled,
             engine,
             threshold,
+            review_timeout_secs: cfg.review_timeout_secs,
+            python_interpreter: cfg.python_interpreter.clone(),
+            worker_script_path: cfg.worker_script_path.clone(),
+            llama_model: cfg.llama_model.clone(),
+            deberta_model: cfg.deberta_model.clone(),
+            deberta_max_length: cfg.deberta_max_length,
+            llama_max_length: cfg.llama_max_length,
+            llama_max_new_tokens: cfg.llama_max_new_tokens,
             child: AsyncMutex::new(None),
             dead: Arc::new(AtomicBool::new(false)),
         }
@@ -254,7 +347,7 @@ impl ReviewWorker {
         }
         let mut guard = self.child.lock().await;
         if guard.is_none() {
-            match spawn_review_worker(&self.engine).await {
+            match spawn_review_worker(self).await {
                 Ok(c) => {
                     // A transient failure set `dead`; a successful spawn revives
                     // review instead of leaving it disabled forever.
@@ -300,7 +393,7 @@ impl ReviewWorker {
             }
         };
 
-        match tokio::time::timeout(Duration::from_secs(10), round_trip).await {
+        match tokio::time::timeout(Duration::from_secs(self.review_timeout_secs), round_trip).await {
             Ok(Ok(Some(risk))) => Some(risk),
             Ok(Ok(None)) => None, // worker responded without a usable risk field
             Ok(Err(e)) => {
@@ -349,11 +442,21 @@ impl Drop for ReviewChild {
     }
 }
 
-async fn spawn_review_worker(engine: &str) -> Result<ReviewChild, Box<dyn std::error::Error>> {
-    let mut cmd = Command::new("python3");
-    cmd.arg("worker/review_worker.py")
+async fn spawn_review_worker(worker: &ReviewWorker) -> Result<ReviewChild, Box<dyn std::error::Error>> {
+    let mut cmd = Command::new(&worker.python_interpreter);
+    cmd.arg(&worker.worker_script_path)
         .arg("--engine")
-        .arg(engine)
+        .arg(&worker.engine)
+        .arg("--llama-model")
+        .arg(&worker.llama_model)
+        .arg("--deberta-model")
+        .arg(&worker.deberta_model)
+        .arg("--deberta-max-length")
+        .arg(worker.deberta_max_length.to_string())
+        .arg("--llama-max-length")
+        .arg(worker.llama_max_length.to_string())
+        .arg("--llama-max-new-tokens")
+        .arg(worker.llama_max_new_tokens.to_string())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
@@ -614,6 +717,17 @@ fn default_config() -> Config {
         llm_review: false,
         llm_review_threshold: default_review_threshold(),
         llm_review_engine: default_review_engine(),
+        review_timeout_secs: default_review_timeout_secs(),
+        python_interpreter: default_python_interpreter(),
+        worker_script_path: default_worker_script_path(),
+        prompt_timeout_secs: default_prompt_timeout_secs(),
+        reconnect_base_secs: default_reconnect_base_secs(),
+        reconnect_max_secs: default_reconnect_max_secs(),
+        llama_model: default_llama_model(),
+        deberta_model: default_deberta_model(),
+        deberta_max_length: default_deberta_max_length(),
+        llama_max_length: default_llama_max_length(),
+        llama_max_new_tokens: default_llama_max_new_tokens(),
     }
 }
 
@@ -643,7 +757,7 @@ async fn load_config(
         "No saved config was found. Enter the list of words to filter, separated by commas.",
         "Banned words (comma-separated)",
         PromptKind::String,
-        60,
+        default_config().prompt_timeout_secs,
     )
     .await;
 
@@ -657,7 +771,7 @@ async fn load_config(
         "Enter the censor mode used when a banned word is detected.",
         "censor mode: soft|mid|hard|replace",
         PromptKind::String,
-        60,
+        default_config().prompt_timeout_secs,
     )
     .await;
 
@@ -687,6 +801,17 @@ async fn load_config(
         llm_review: default.llm_review,
         llm_review_threshold: default.llm_review_threshold,
         llm_review_engine: default.llm_review_engine,
+        review_timeout_secs: default.review_timeout_secs,
+        python_interpreter: default.python_interpreter,
+        worker_script_path: default.worker_script_path,
+        prompt_timeout_secs: default.prompt_timeout_secs,
+        reconnect_base_secs: default.reconnect_base_secs,
+        reconnect_max_secs: default.reconnect_max_secs,
+        llama_model: default.llama_model,
+        deberta_model: default.deberta_model,
+        deberta_max_length: default.deberta_max_length,
+        llama_max_length: default.llama_max_length,
+        llama_max_new_tokens: default.llama_max_new_tokens,
     };
 
     save_config(&config);
@@ -839,7 +964,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // The engine connection dropped — reconnect with backoff
                 // instead of leaving the module unresponsive.
                 info!("Engine disconnected — reconnecting...");
-                let mut backoff = 1u64;
+                let reconnect_cfg = config_shared.lock().unwrap().clone();
+                let mut backoff = reconnect_cfg.reconnect_base_secs;
                 loop {
                     tokio::time::sleep(Duration::from_secs(backoff)).await;
                     match CockatielClient::connect("banned_words.json").await {
@@ -860,7 +986,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(e) => {
                             warn!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
-                            backoff = (backoff * 2).min(30);
+                            backoff = (backoff * 2).min(reconnect_cfg.reconnect_max_secs);
                         }
                     }
                 }
@@ -881,6 +1007,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.llm_review,
         config.llm_review_engine.clone(),
         config.llm_review_threshold,
+        &config,
     )));
     info!(
         "Banned-words module active: mode={}, {} word(s), llm_review={} (engine={}, threshold={})",
@@ -975,6 +1102,10 @@ mod tests {
         }
     }
 
+    fn test_worker(enabled: bool, engine: &str, threshold: f64) -> ReviewWorker {
+        ReviewWorker::new(enabled, engine.to_string(), threshold, &default_config())
+    }
+
     #[test]
     fn llm_review_off_by_default() {
         assert!(!default_config().llm_review);
@@ -983,14 +1114,48 @@ mod tests {
     }
 
     #[test]
+    fn new_tuning_defaults_and_partial_deserialize() {
+        let d = default_config();
+        assert_eq!(d.review_timeout_secs, 10);
+        assert_eq!(d.python_interpreter, "python3");
+        assert_eq!(d.worker_script_path, "worker/review_worker.py");
+        assert_eq!(d.prompt_timeout_secs, 60);
+        assert_eq!(d.reconnect_base_secs, 1);
+        assert_eq!(d.reconnect_max_secs, 30);
+        assert_eq!(d.llama_model, "meta-llama/Llama-Guard-3-1B");
+        assert_eq!(d.deberta_model, "microsoft/deberta-v3-small");
+        assert_eq!(d.deberta_max_length, 256);
+        assert_eq!(d.llama_max_length, 2000);
+        assert_eq!(d.llama_max_new_tokens, 16);
+        // A legacy/partial module_specific object still gets every new default.
+        let partial: Config = serde_json::from_value(serde_json::json!({
+            "banned_words": ["x"],
+            "censor_mode": "hard",
+        }))
+        .unwrap();
+        assert_eq!(partial.review_timeout_secs, 10);
+        assert_eq!(partial.llama_model, "meta-llama/Llama-Guard-3-1B");
+        assert_eq!(partial.deberta_max_length, 256);
+        assert_eq!(partial.llama_max_new_tokens, 16);
+        // An explicit override is honored.
+        let overridden: Config = serde_json::from_value(serde_json::json!({
+            "llama_max_new_tokens": 64,
+            "review_timeout_secs": 20,
+        }))
+        .unwrap();
+        assert_eq!(overridden.llama_max_new_tokens, 64);
+        assert_eq!(overridden.review_timeout_secs, 20);
+    }
+
+    #[test]
     fn threshold_hit_and_miss() {
-        let w = ReviewWorker::new(true, "deberta".to_string(), 0.5);
+        let w = test_worker(true, "deberta", 0.5);
         assert!(w.is_hit(0.9));
         assert!(w.is_hit(0.5)); // >= threshold is a hit
         assert!(!w.is_hit(0.3));
         assert!(!w.is_hit(0.0));
 
-        let strict = ReviewWorker::new(true, "deberta".to_string(), 0.9);
+        let strict = test_worker(true, "deberta", 0.9);
         assert!(!strict.is_hit(0.5));
         assert!(strict.is_hit(0.95));
     }
@@ -999,7 +1164,7 @@ mod tests {
     fn disabled_worker_never_reviews() {
         // A disabled worker is a no-op: review() returns None without spawning.
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let w = ReviewWorker::new(false, "deberta".to_string(), 0.5);
+        let w = test_worker(false, "deberta", 0.5);
         let r = rt.block_on(w.review("anything"));
         assert!(r.is_none());
     }
@@ -1010,7 +1175,7 @@ mod tests {
         // (no models needed): request id is echoed, risk comes back, and a
         // healthy worker stays alive across calls (no desync / no kill).
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let w = ReviewWorker::new(true, "mock".to_string(), 0.5);
+        let w = test_worker(true, "mock", 0.5);
         let r = rt.block_on(w.review("hello world"));
         assert_eq!(r, Some(0.9));
         let r2 = rt.block_on(w.review("second message"));
