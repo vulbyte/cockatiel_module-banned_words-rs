@@ -3,8 +3,8 @@
 
 The Rust module spawns this ONLY when `llm_review` is enabled in config.json.
 Protocol:
-  stdin   JSONL requests  {"text": "..."}
-  stdout  JSONL responses {"risk": 0-1, "label": "safe"|"unsafe", "error": ...}
+  stdin   JSONL requests  {"id": "...", "text": "..."}  (id is echoed back)
+  stdout  JSONL responses {"id": ..., "risk": 0-1, "label": "safe"|"unsafe", "error": ...}
   stderr  logs + a final READY line (module can wait on it if it wants)
 
 Engines (all optional; the module degrades to word-list-only when unavailable):
@@ -58,7 +58,9 @@ def score_llama_guard(tok, model, text):
         "Task: classify the message as safe or unsafe.\n\n"
         "User message: " + text + "\n\nAnswer:"
     )
-    enc = tok(prompt, return_tensors="pt")
+    # Truncate so a huge hostile message can't blow up the input tensor (OOM) —
+    # mirrors the truncation score_deberta already does.
+    enc = tok(prompt, truncation=True, max_length=2000, return_tensors="pt")
     with torch.no_grad():
         out = model.generate(**enc, max_new_tokens=16, do_sample=False)
     verdict = tok.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)
@@ -84,13 +86,16 @@ def main():
             line = line.strip()
             if not line:
                 continue
+            req_id = None
             try:
                 req = json.loads(line)
-                print(json.dumps({"risk": args.mock_risk,
+                req_id = req.get("id")
+                print(json.dumps({"id": req_id,
+                                  "risk": args.mock_risk,
                                   "label": "unsafe" if args.mock_risk > 0.5 else "safe"}),
                       flush=True)
             except Exception as exc:  # noqa: BLE001
-                print(json.dumps({"error": str(exc)}), flush=True)
+                print(json.dumps({"id": req_id, "error": str(exc)}), flush=True)
         return
 
     try:
@@ -107,16 +112,18 @@ def main():
         line = line.strip()
         if not line:
             continue
+        req_id = None
         try:
             req = json.loads(line)
+            req_id = req.get("id")
             text = req.get("text", "")
             if actual == "llama-guard":
                 risk, label = score_llama_guard(tok, model, text)
             else:
                 risk, label = score_deberta(tok, model, text)
-            print(json.dumps({"risk": risk, "label": label}), flush=True)
+            print(json.dumps({"id": req_id, "risk": risk, "label": label}), flush=True)
         except Exception as exc:  # noqa: BLE001
-            print(json.dumps({"error": str(exc)}), flush=True)
+            print(json.dumps({"id": req_id, "error": str(exc)}), flush=True)
 
 
 if __name__ == "__main__":

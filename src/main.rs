@@ -188,13 +188,15 @@ fn censor_message(message: &str, banned: &[String], mode: &str, replace_word: &s
         } else {
             result.push_str(token);
         }
-        result.push_str(&remainder[..0]); // empty
-        rest = &remainder;
+        rest = remainder;
         // Preserve the delimiter (the split_at consumed it as part of remainder).
+        // Push the whole first char — a multi-byte whitespace (e.g. U+3000,
+        // U+00A0) must never be byte-sliced (that panics mid-char).
         if !rest.is_empty() && end < message.len() {
-            // remainder starts with the whitespace that ended the token.
-            result.push_str(&rest[..1]);
-            rest = &rest[1..];
+            if let Some(c) = rest.chars().next() {
+                result.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
         }
     }
     result
@@ -213,6 +215,9 @@ struct ReviewWorker {
 }
 
 struct ReviewChild {
+    /// The spawned process handle — kept so every error path can kill + reap it
+    /// instead of leaking an orphaned Python worker across restarts.
+    child: tokio::process::Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
@@ -228,16 +233,34 @@ impl ReviewWorker {
         }
     }
 
+    /// Re-enable review after a reconnect (fresh connection = fresh start).
+    fn reset_dead(&self) {
+        self.dead.store(false, Ordering::SeqCst);
+    }
+
     /// Score a message. None = disabled, worker failed to start, timed out, or
     /// an error — the caller passes the message through unreviewed.
+    ///
+    /// The whole request-write + response-read round trip runs under a single
+    /// timeout so a hung worker (e.g. llama-guard on CPU) can never wedge the
+    /// caller. Each request carries an `id` that the worker echoes back; any
+    /// response whose id doesn't match (a stale reply from a previously
+    /// abandoned request) is discarded, so a risk can never be mis-attributed
+    /// to the wrong message. On timeout or worker error the child is killed and
+    /// reaped; the next review spawns a fresh worker (reviving `dead`).
     async fn review(&self, text: &str) -> Option<f64> {
-        if !self.enabled || self.dead.load(Ordering::SeqCst) {
+        if !self.enabled {
             return None;
         }
         let mut guard = self.child.lock().await;
         if guard.is_none() {
             match spawn_review_worker(&self.engine).await {
-                Ok(c) => *guard = Some(c),
+                Ok(c) => {
+                    // A transient failure set `dead`; a successful spawn revives
+                    // review instead of leaving it disabled forever.
+                    self.dead.store(false, Ordering::SeqCst);
+                    *guard = Some(c);
+                }
                 Err(e) => {
                     warn!("llm_review: worker failed to start ({}); disabling review", e);
                     self.dead.store(true, Ordering::SeqCst);
@@ -246,30 +269,61 @@ impl ReviewWorker {
             }
         }
         let child = guard.as_mut()?;
-        let req = serde_json::json!({ "text": text }).to_string();
-        if child.stdin.write_all(req.as_bytes()).await.is_err() || child.stdin.write_all(b"\n").await.is_err() {
-            self.dead.store(true, Ordering::SeqCst);
-            return None;
-        }
-        let mut line = String::new();
-        match tokio::time::timeout(Duration::from_secs(2), child.stdout.read_line(&mut line)).await {
-            Ok(Ok(n)) if n > 0 => {
-                match serde_json::from_str::<serde_json::Value>(&line) {
-                    Ok(v) => {
-                        if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-                            // The worker is broken (model missing / HF-gated): warn
-                            // once + disable so we stop paying per-message timeouts.
-                            warn!("llm_review worker error ({}); disabling review", err);
-                            self.dead.store(true, Ordering::SeqCst);
-                            None
-                        } else {
-                            v.get("risk").and_then(|r| r.as_f64())
-                        }
-                    }
-                    Err(_) => None,
-                }
+        let id = uuid::Uuid::now_v7().to_string();
+        let req = serde_json::json!({ "id": id, "text": text }).to_string();
+
+        let round_trip = async {
+            if child.stdin.write_all(req.as_bytes()).await.is_err()
+                || child.stdin.write_all(b"\n").await.is_err()
+            {
+                return Err("write to worker failed".to_string());
             }
-            _ => None, // timeout or worker gone
+            loop {
+                let mut line = String::new();
+                match child.stdout.read_line(&mut line).await {
+                    Ok(0) => return Err("worker closed stdout".to_string()),
+                    Ok(_) => {}
+                    Err(e) => return Err(format!("read from worker failed: {}", e)),
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue; // partial/garbage line — keep reading
+                };
+                // Discard stale responses (from a previously timed-out request)
+                // so they can't be attributed to the current message.
+                if v.get("id").and_then(|i| i.as_str()) != Some(id.as_str()) {
+                    continue;
+                }
+                if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+                    return Err(format!("worker error: {}", err));
+                }
+                return Ok(v.get("risk").and_then(|r| r.as_f64()));
+            }
+        };
+
+        match tokio::time::timeout(Duration::from_secs(10), round_trip).await {
+            Ok(Ok(Some(risk))) => Some(risk),
+            Ok(Ok(None)) => None, // worker responded without a usable risk field
+            Ok(Err(e)) => {
+                // The worker is broken (model missing / HF-gated / died): warn +
+                // disable so we stop paying per-message timeouts, kill + reap it.
+                warn!("llm_review worker error ({}); killing worker", e);
+                self.dead.store(true, Ordering::SeqCst);
+                if let Some(c) = guard.take() {
+                    kill_and_reap(c).await;
+                }
+                None
+            }
+            Err(_) => {
+                // Round-trip timed out — the worker may still be churning on our
+                // request. Kill + reap so its eventual response can't poison the
+                // next review; a fresh worker respawns on the next review.
+                warn!("llm_review round-trip timed out; killing worker");
+                self.dead.store(true, Ordering::SeqCst);
+                if let Some(c) = guard.take() {
+                    kill_and_reap(c).await;
+                }
+                None
+            }
         }
     }
 
@@ -277,6 +331,21 @@ impl ReviewWorker {
     /// risk-certainty threshold.
     fn is_hit(&self, risk: f64) -> bool {
         risk >= self.threshold
+    }
+}
+
+/// Kill + reap a worker. Called on every error/timeout path so no orphaned
+/// Python processes accumulate across restarts.
+async fn kill_and_reap(mut child: ReviewChild) {
+    let _ = child.child.kill().await;
+    let _ = child.child.wait().await;
+}
+
+impl Drop for ReviewChild {
+    fn drop(&mut self) {
+        // Module-exit safety net: best-effort kill so a live worker can't
+        // outlive the module. (The async error paths kill + wait explicitly.)
+        let _ = self.child.start_kill();
     }
 }
 
@@ -291,7 +360,11 @@ async fn spawn_review_worker(engine: &str) -> Result<ReviewChild, Box<dyn std::e
     let mut child = cmd.spawn()?;
     let stdin = child.stdin.take().ok_or("no stdin")?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
-    Ok(ReviewChild { stdin, stdout: BufReader::new(stdout) })
+    Ok(ReviewChild {
+        child,
+        stdin,
+        stdout: BufReader::new(stdout),
+    })
 }
 
 /// Build the ChatMessageRejected record a module sends to the engine so the
@@ -308,6 +381,110 @@ fn compose_rejected(
         processed_message: processed.to_string(),
         reason: reason.to_string(),
         origin: "banned-words".to_string(),
+    }
+}
+
+/// Identity the engine assigned to this module session (refreshed on reconnect).
+struct EngineIdentity {
+    auth: String,
+    module: String,
+    instance: String,
+}
+
+/// Handle a single MessagePreProcess: run the word-list detector (and, when
+/// enabled, the LLM review), censor if flagged, and reply with the processed
+/// message so the engine acks pre_process. If `flag_for_review`, also log a
+/// ChatMessageRejected. Called either inline from the read loop (word-list
+/// path) or from a spawned task (LLM-review path, so the loop keeps answering
+/// AuthVerify while the worker runs).
+async fn process_message(
+    config: &Config,
+    worker: &Option<Arc<ReviewWorker>>,
+    chat: &ChatMessage,
+    uuid: &str,
+    identity: &EngineIdentity,
+    write_shared: &Arc<AsyncMutex<WsWriteHalf>>,
+) {
+    let original = chat.raw_message.clone();
+    let mut flagged = false;
+    let mut reason = String::new();
+    match detect_banned(&original, &config.banned_words) {
+        Some((word, variant)) => {
+            warn!("Banned word '{}' detected via {} variant", word, variant);
+            flagged = true;
+            reason = format!("banned word '{}' via {} variant", word, variant);
+        }
+        None if config.llm_review => {
+            // Optional LLM review: catch what the word list missed. Risk >= the
+            // configurable certainty threshold is treated exactly like a hit.
+            if let Some(w) = worker {
+                if let Some(risk) = w.review(&original).await {
+                    if w.is_hit(risk) {
+                        warn!("LLM review flagged message (risk={})", risk);
+                        flagged = true;
+                        reason = format!(
+                            "LLM risk {} >= threshold {}",
+                            risk, config.llm_review_threshold
+                        );
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let censored = if flagged {
+        apply_censor(config, &original)
+    } else {
+        original.clone()
+    };
+
+    // If flag_for_review, send a ChatMessageRejected so the engine logs the
+    // rejection clearly (reason + raw + processed) instead of an obscure log.
+    if flagged && config.flag_for_review {
+        let rej = compose_rejected(uuid, chat, &censored, &reason);
+        let log = Container {
+            version: 1,
+            auth_token: identity.auth.clone(),
+            module_name: identity.module.clone(),
+            module_instance_uuid7: identity.instance.clone(),
+            payload: Some(Payload::ChatMessageRejected(rej)),
+        };
+        let mut buf = Vec::new();
+        if log.encode(&mut buf).is_ok() {
+            let mut w = write_shared.lock().await;
+            let _ = w.send(WsMessage::Binary(buf)).await;
+        }
+    }
+
+    // Reply with the (possibly censored) message, same uuid → engine acks pre_process.
+    let reply = Container {
+        version: 1,
+        auth_token: identity.auth.clone(),
+        module_name: identity.module.clone(),
+        module_instance_uuid7: identity.instance.clone(),
+        payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+            audio: Vec::new(),
+            audio_type: String::new(),
+            message_uuid7: uuid.to_string(),
+            raw_message: Some(ChatMessage {
+                platform: chat.platform.clone(),
+                raw_data: chat.raw_data.clone(),
+                raw_message: censored.clone(),
+                user_uuid7: chat.user_uuid7.clone(),
+                command: chat.command.clone(),
+                channel_id: chat.channel_id.clone(),
+                user_data: chat.user_data.clone(),
+            }),
+        })),
+    };
+    let mut buf = Vec::new();
+    if reply.encode(&mut buf).is_ok() {
+        let mut w = write_shared.lock().await;
+        let _ = w.send(WsMessage::Binary(buf)).await;
+        if flagged {
+            info!("Censored message ({}): {:?} -> {:?}", uuid, original, censored);
+        }
     }
 }
 
@@ -375,7 +552,7 @@ async fn prompt_for_input(
         return None;
     }
     let mut guard = write_ws.lock().await;
-    if guard.send(WsMessage::Binary(buf.into())).await.is_err() {
+    if guard.send(WsMessage::Binary(buf)).await.is_err() {
         return None;
     }
     drop(guard);
@@ -527,7 +704,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect to the engine as a preprocess module (CLI overrides: --ip/--port/--pin).
     let client = CockatielClient::connect("banned_words.json").await?;
-    let (write, mut read) = client.stream.split();
+    let (write, read) = client.stream.split();
     let write_shared: Arc<AsyncMutex<WsWriteHalf>> = Arc::new(AsyncMutex::new(write));
     let auth_token = client.auth_token.clone();
     let instance_uuid = client.instance_uuid7.clone();
@@ -547,134 +724,145 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read task: forward PromptResponses to the awaiting prompt AND handle
     // message pre-processing. Spawned BEFORE load_config so prompts work.
+    // Owns the read half + identity so it can reconnect with backoff when the
+    // engine drops the socket (instead of dying and leaving main to sleep
+    // forever while the watchdog severs the unresponsive module).
     {
         let prompt_tx_task = prompt_tx.clone();
         let config_shared = Arc::clone(&config_shared);
         let review_worker_shared = Arc::clone(&review_worker_shared);
         let write_shared = Arc::clone(&write_shared);
-        let auth_token = auth_token.clone();
-        let module_name = module_name.clone();
-        let instance_uuid = instance_uuid.clone();
+        // Identity + read half live in the task so a reconnect can refresh them
+        // (the engine forgets a session when the socket drops).
+        let mut auth_token = auth_token.clone();
+        let mut instance_uuid = instance_uuid.clone();
+        let mut module_name = module_name.clone();
+        let mut read = read;
         tokio::spawn(async move {
-            while let Some(msg) = read.next().await {
-                let Ok(WsMessage::Binary(data)) = msg else { continue };
-                let Ok(container) = Container::decode(data.as_ref()) else { continue };
-
-                match container.payload {
-                    Some(Payload::AuthVerify(_)) => {
-                        // Answer the engine's liveness probe (this module reads
-                        // the socket directly, so the client's auto-answer is
-                        // bypassed — without this the watchdog severs us).
-                        let reply = Container {
-                            version: 1,
-                            auth_token: auth_token.clone(),
-                            module_name: module_name.clone(),
-                            module_instance_uuid7: instance_uuid.clone(),
-                            payload: Some(Payload::AuthVerify(AuthVerify {
-                                cur_auth: auth_token.clone(),
-                            })),
-                        };
-                        let mut buf = Vec::new();
-                        if reply.encode(&mut buf).is_ok() {
-                            let mut w = write_shared.lock().await;
-                            let _ = w.send(WsMessage::Binary(buf.into())).await;
+            'reconnect: loop {
+                loop {
+                    let Some(msg) = read.next().await else { break };
+                    let data = match msg {
+                        Ok(WsMessage::Binary(d)) => d,
+                        Ok(WsMessage::Close(_)) => {
+                            info!("Engine closed connection");
+                            break;
                         }
-                    }
-                    Some(Payload::PromptResponse(resp)) => {
-                        // Forward operator answers to the awaiting prompt.
-                        let _ = prompt_tx_task.send(resp);
-                    }
-                    Some(Payload::MessagePreProcess(pre)) => {
-                        let Some(chat) = &pre.raw_message else { continue };
-                        let config = config_shared.lock().unwrap().clone();
-                        let original = chat.raw_message.clone();
-                        let uuid = pre.message_uuid7.clone();
-                        let worker = review_worker_shared.lock().unwrap().clone();
-
-                        let mut flagged = false;
-                        let mut reason = String::new();
-                        match detect_banned(&original, &config.banned_words) {
-                            Some((word, variant)) => {
-                                warn!("Banned word '{}' detected via {} variant", word, variant);
-                                flagged = true;
-                                reason = format!("banned word '{}' via {} variant", word, variant);
-                            }
-                            None if config.llm_review => {
-                                // Optional LLM review: catch what the word list
-                                // missed. Risk >= the configurable certainty
-                                // threshold is treated exactly like a word hit.
-                                if let Some(w) = &worker {
-                                    if let Some(risk) = w.review(&original).await {
-                                        if w.is_hit(risk) {
-                                            warn!("LLM review flagged message (risk={})", risk);
-                                            flagged = true;
-                                            reason = format!(
-                                                "LLM risk {} >= threshold {}",
-                                                risk, config.llm_review_threshold
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
+                        Ok(_) => continue,
+                        Err(e) => {
+                            warn!("Engine WebSocket error: {}", e);
+                            break;
                         }
+                    };
+                    let Ok(container) = Container::decode(data.as_ref()) else { continue };
 
-                        let censored = if flagged {
-                            apply_censor(&config, &original)
-                        } else {
-                            original.clone()
-                        };
-
-                        // If flag_for_review, send a ChatMessageRejected so the
-                        // engine logs the rejection clearly (reason + raw +
-                        // processed) instead of an obscure log string.
-                        if flagged && config.flag_for_review {
-                            let rej = compose_rejected(&uuid, chat, &censored, &reason);
-                            let log = Container {
+                    match container.payload {
+                        Some(Payload::AuthVerify(_)) => {
+                            // Answer the engine's liveness probe (this module
+                            // reads the socket directly, so the client's
+                            // auto-answer is bypassed — without this the
+                            // watchdog severs us).
+                            let reply = Container {
                                 version: 1,
                                 auth_token: auth_token.clone(),
                                 module_name: module_name.clone(),
                                 module_instance_uuid7: instance_uuid.clone(),
-                                payload: Some(Payload::ChatMessageRejected(rej)),
+                                payload: Some(Payload::AuthVerify(AuthVerify {
+                                    cur_auth: auth_token.clone(),
+                                })),
                             };
                             let mut buf = Vec::new();
-                            if log.encode(&mut buf).is_ok() {
+                            if reply.encode(&mut buf).is_ok() {
                                 let mut w = write_shared.lock().await;
-                                let _ = w.send(WsMessage::Binary(buf.into())).await;
+                                let _ = w.send(WsMessage::Binary(buf)).await;
                             }
                         }
+                        Some(Payload::PromptResponse(resp)) => {
+                            // Forward operator answers to the awaiting prompt.
+                            let _ = prompt_tx_task.send(resp);
+                        }
+                        Some(Payload::MessagePreProcess(pre)) => {
+                            let Some(chat) = &pre.raw_message else { continue };
+                            let config = config_shared.lock().unwrap().clone();
+                            let original = chat.raw_message.clone();
+                            let uuid = pre.message_uuid7.clone();
+                            let worker = review_worker_shared.lock().unwrap().clone();
 
-                        // Reply with the (possibly censored) message, same uuid → engine acks pre_process.
-                        let reply = Container {
-                            version: 1,
-                            auth_token: auth_token.clone(),
-                            module_name: module_name.clone(),
-                            module_instance_uuid7: instance_uuid.clone(),
-                            payload: Some(Payload::MessagePreProcess(MessagePreProcess {
-audio: Vec::new(),
-                        audio_type: String::new(),
-                                message_uuid7: uuid.clone(),
-                                raw_message: Some(ChatMessage {
-                                    platform: chat.platform.clone(),
-                                    raw_data: chat.raw_data.clone(),
-                                    raw_message: censored.clone(),
-                                    user_uuid7: chat.user_uuid7.clone(),
-                                    command: chat.command.clone(),
-                                    channel_id: chat.channel_id.clone(),
-                                    user_data: chat.user_data.clone(),
-                                }),
-                            })),
-                        };
-                        let mut buf = Vec::new();
-                        if reply.encode(&mut buf).is_ok() {
-                            let mut w = write_shared.lock().await;
-                            let _ = w.send(WsMessage::Binary(buf.into())).await;
-                            if flagged {
-                                info!("Censored message ({}): {:?} -> {:?}", uuid, original, censored);
+                            // LLM review can take up to ~10s and may time out.
+                            // Run it OFF the read loop (spawned task) so the
+                            // loop keeps answering AuthVerify probes while the
+                            // worker runs. Only detour when the word list
+                            // missed AND review is enabled — word hits keep the
+                            // fast inline path.
+                            if config.llm_review
+                                && worker.is_some()
+                                && detect_banned(&original, &config.banned_words).is_none()
+                            {
+                                let identity = EngineIdentity {
+                                    auth: auth_token.clone(),
+                                    module: module_name.clone(),
+                                    instance: instance_uuid.clone(),
+                                };
+                                let (cfg, w, ch, u, idnt, ws) = (
+                                    config.clone(),
+                                    worker.clone().unwrap(),
+                                    chat.clone(),
+                                    uuid.clone(),
+                                    identity,
+                                    Arc::clone(&write_shared),
+                                );
+                                tokio::spawn(async move {
+                                    process_message(&cfg, &Some(w), &ch, &u, &idnt, &ws).await;
+                                });
+                                continue;
                             }
+
+                            let identity = EngineIdentity {
+                                auth: auth_token.clone(),
+                                module: module_name.clone(),
+                                instance: instance_uuid.clone(),
+                            };
+                            process_message(
+                                &config,
+                                &worker,
+                                chat,
+                                &uuid,
+                                &identity,
+                                &write_shared,
+                            )
+                            .await;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // The engine connection dropped — reconnect with backoff
+                // instead of leaving the module unresponsive.
+                info!("Engine disconnected — reconnecting...");
+                let mut backoff = 1u64;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    match CockatielClient::connect("banned_words.json").await {
+                        Ok(conn) => {
+                            info!("Reconnected to engine");
+                            let (w, r) = conn.stream.split();
+                            *write_shared.lock().await = w;
+                            auth_token = conn.auth_token;
+                            instance_uuid = conn.instance_uuid7;
+                            module_name = conn.config.module_name;
+                            read = r;
+                            // A fresh session is a fresh start: a transient
+                            // worker failure must not persist across a reconnect.
+                            if let Some(w) = review_worker_shared.lock().unwrap().clone() {
+                                w.reset_dead();
+                            }
+                            continue 'reconnect;
+                        }
+                        Err(e) => {
+                            warn!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
+                            backoff = (backoff * 2).min(30);
                         }
                     }
-                    _ => {}
                 }
             }
         });
@@ -768,6 +956,16 @@ mod tests {
         assert_eq!(out, "******* is a word");
     }
 
+    #[test]
+    fn censor_message_multibyte_whitespace_delimiter_no_panic() {
+        // U+3000 (ideographic space) and U+00A0 (no-break space) are accepted
+        // by char::is_whitespace — byte-slicing them used to panic mid-char.
+        assert_eq!(censor_message("badword\u{3000}ok", &banned(), "hard", ""), "*******\u{3000}ok");
+        assert_eq!(censor_message("badword\u{00a0}ok", &banned(), "hard", ""), "*******\u{00a0}ok");
+        // Trailing multi-byte whitespace must also survive.
+        assert_eq!(censor_message("badword\u{3000}", &banned(), "hard", ""), "*******\u{3000}");
+    }
+
     fn cfg_with_review() -> Config {
         Config {
             llm_review: true,
@@ -804,6 +1002,19 @@ mod tests {
         let w = ReviewWorker::new(false, "deberta".to_string(), 0.5);
         let r = rt.block_on(w.review("anything"));
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn review_round_trip_with_mock_worker() {
+        // End-to-end protocol check against the real worker in "mock" mode
+        // (no models needed): request id is echoed, risk comes back, and a
+        // healthy worker stays alive across calls (no desync / no kill).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let w = ReviewWorker::new(true, "mock".to_string(), 0.5);
+        let r = rt.block_on(w.review("hello world"));
+        assert_eq!(r, Some(0.9));
+        let r2 = rt.block_on(w.review("second message"));
+        assert_eq!(r2, Some(0.9));
     }
 
     #[test]
