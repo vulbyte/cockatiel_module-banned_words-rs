@@ -1,84 +1,86 @@
 {
-  "name": "banned-words",
-  "description": "preprocess module that detects and censors banned words (no-spaces, leet, extra-spaces), optionally flags messages for review, and can run an optional LLM review (deberta/llama-guard) with a configurable risk threshold",
-  "version": "0.2.0",
-  "capabilities": "preprocess",
-  "root_file": "./src/main.rs",
-  "launch_command": "cargo run",
-  "command_flags": [
-    "--release"
-  ],
   "autostart": true,
-  "credentials": [
-    {
-      "key": "banned_words",
-      "label": "Banned Words",
-      "sensitive": false,
-      "list": true
-    },
-    {
-      "key": "censor_mode",
-      "label": "Censor Mode (soft/mid/hard/replace/flag)",
-      "sensitive": false,
-      "list": false
-    },
-    {
-      "key": "replace_word",
-      "label": "Replacement Word",
-      "sensitive": false,
-      "list": false
-    },
-    {
-      "key": "flag_for_review",
-      "label": "Flag flagged messages for review",
-      "sensitive": false,
-      "list": false
-    },
-    {
-      "key": "llm_review",
-      "label": "Optional LLM review (on/off)",
-      "sensitive": false,
-      "list": false
-    },
-    {
-      "key": "llm_review_threshold",
-      "label": "Risk certainty threshold (0-1)",
-      "sensitive": false,
-      "list": false
-    },
-    {
-      "key": "llm_review_engine",
-      "label": "Review engine (deberta/llama-guard/auto)",
-      "sensitive": false,
-      "list": false
-    },
-    {
-      "key": "huggingface_token",
-      "label": "HuggingFace token (for llama-guard)",
-      "sensitive": true,
-      "list": false
-    }
-  ],
   "binary": {
-    "macos": {
-      "x86_64": "target/release/banned_words_rs",
-      "aarch64": "target/release/banned_words_rs",
-      "arm": "target/release/banned_words_rs"
-    },
     "linux": {
-      "x86_64": "target/release/banned_words_rs",
       "aarch64": "target/release/banned_words_rs",
-      "arm": "target/release/banned_words_rs"
+      "arm": "target/release/banned_words_rs",
+      "x86_64": "target/release/banned_words_rs"
+    },
+    "macos": {
+      "aarch64": "target/release/banned_words_rs",
+      "arm": "target/release/banned_words_rs",
+      "x86_64": "target/release/banned_words_rs"
     },
     "windows": {
-      "x86_64": "target/release/banned_words_rs.exe",
       "aarch64": "target/release/banned_words_rs.exe",
-      "arm": "target/release/banned_words_rs.exe"
+      "arm": "target/release/banned_words_rs.exe",
+      "x86_64": "target/release/banned_words_rs.exe"
     }
   },
   "build_command": "cargo",
   "build_flags": [
     "build",
     "--release"
-  ]
+  ],
+  "capabilities": "preprocess",
+  "command_flags": [
+    "--release"
+  ],
+  "credentials": [
+    {
+      "key": "banned_words",
+      "label": "Banned Words",
+      "list": true,
+      "sensitive": false
+    },
+    {
+      "key": "censor_mode",
+      "label": "Censor Mode (soft/mid/hard/replace/flag)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "replace_word",
+      "label": "Replacement Word",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "flag_for_review",
+      "label": "Flag flagged messages for review",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "llm_review",
+      "label": "Optional LLM review (on/off)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "llm_review_threshold",
+      "label": "Risk certainty threshold (0-1)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "llm_review_engine",
+      "label": "Review engine (deberta/llama-guard/auto)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "huggingface_token",
+      "label": "HuggingFace token (for llama-guard)",
+      "list": false,
+      "sensitive": true
+    }
+  ],
+  "description": "preprocess module that detects and censors banned words (no-spaces, leet, extra-spaces), optionally flags messages for review, and can run an optional LLM review (deberta/llama-guard) with a configurable risk threshold",
+  "launch_command": "cargo run",
+  "name": "banned-words",
+  "root_file": "./src/main.rs",
+  "version": "0.2.0",
+  "price": 0,
+  "min_rank": 0
 }
