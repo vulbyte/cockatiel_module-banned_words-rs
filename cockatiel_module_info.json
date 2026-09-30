@@ -1,4 +1,5 @@
 {
+  "authority": 0,
   "autostart": true,
   "binary": {
     "linux": {
@@ -22,7 +23,7 @@
     "build",
     "--release"
   ],
-  "capabilities": "preprocess",
+  "capabilities": "inprocess",
   "command_flags": [
     "--release"
   ],
@@ -76,12 +77,11 @@
       "sensitive": true
     }
   ],
-  "description": "preprocess module that detects and censors banned words (no-spaces, leet, extra-spaces), optionally flags messages for review, and can run an optional LLM review (deberta/llama-guard) with a configurable risk threshold",
+  "description": "in-process module that detects and censors banned words (no-spaces, leet, extra-spaces), optionally flags messages for review, and can run an optional LLM review (deberta/llama-guard) with a configurable risk threshold",
   "launch_command": "cargo run",
-  "name": "banned-words",
-  "root_file": "./src/main.rs",
-  "version": "0.2.0",
-  "price": 0,
   "min_rank": 0,
-  "authority": 0
+  "name": "banned-words",
+  "price": 0,
+  "root_file": "./src/main.rs",
+  "version": "0.2.0"
 }

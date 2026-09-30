@@ -494,9 +494,9 @@ struct EngineIdentity {
     instance: String,
 }
 
-/// Handle a single MessagePreProcess: run the word-list detector (and, when
+/// Handle a single MessageInProcess: run the word-list detector (and, when
 /// enabled, the LLM review), censor if flagged, and reply with the processed
-/// message so the engine acks pre_process. If `flag_for_review`, also log a
+/// message so the engine acks in_process. If `flag_for_review`, also log a
 /// ChatMessageRejected. Called either inline from the read loop (word-list
 /// path) or from a spawned task (LLM-review path, so the loop keeps answering
 /// AuthVerify while the worker runs).
@@ -560,15 +560,13 @@ async fn process_message(
         }
     }
 
-    // Reply with the (possibly censored) message, same uuid → engine acks pre_process.
+    // Reply with the (possibly censored) message, same uuid → engine acks in_process.
     let reply = Container {
         version: 1,
         auth_token: identity.auth.clone(),
         module_name: identity.module.clone(),
         module_instance_uuid7: identity.instance.clone(),
-        payload: Some(Payload::MessagePreProcess(MessagePreProcess {
-            audio: Vec::new(),
-            audio_type: String::new(),
+        payload: Some(Payload::MessageInProcess(MessageInProcess {
             message_uuid7: uuid.to_string(),
             raw_message: Some(ChatMessage {
                 platform: chat.platform.clone(),
@@ -579,6 +577,10 @@ async fn process_message(
                 channel_id: chat.channel_id.clone(),
                 user_data: chat.user_data.clone(),
             }),
+            processed_message: censored.clone(),
+            abandon_message: false,
+            audio: Vec::new(),
+            audio_type: String::new(),
         })),
     };
     let mut buf = Vec::new();
@@ -827,7 +829,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
-    // Connect to the engine as a preprocess module (CLI overrides: --ip/--port/--pin).
+    // Connect to the engine as an in-process module (CLI overrides: --ip/--port/--pin).
     let client = CockatielClient::connect("banned_words.json").await?;
     let (write, read) = client.stream.split();
     let write_shared: Arc<AsyncMutex<WsWriteHalf>> = Arc::new(AsyncMutex::new(write));
@@ -848,7 +850,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let review_worker_shared: Arc<Mutex<Option<Arc<ReviewWorker>>>> = Arc::new(Mutex::new(None));
 
     // Read task: forward PromptResponses to the awaiting prompt AND handle
-    // message pre-processing. Spawned BEFORE load_config so prompts work.
+    // message in-processing. Spawned BEFORE load_config so prompts work.
     // Owns the read half + identity so it can reconnect with backoff when the
     // engine drops the socket (instead of dying and leaving main to sleep
     // forever while the watchdog severs the unresponsive module).
@@ -906,11 +908,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Forward operator answers to the awaiting prompt.
                             let _ = prompt_tx_task.send(resp);
                         }
-                        Some(Payload::MessagePreProcess(pre)) => {
-                            let Some(chat) = &pre.raw_message else { continue };
+                        Some(Payload::MessageInProcess(process)) => {
+                            let Some(chat) = &process.raw_message else { continue };
                             let config = config_shared.lock().unwrap().clone();
-                            let original = chat.raw_message.clone();
-                            let uuid = pre.message_uuid7.clone();
+                            let original = process.processed_message.clone();
+                            let uuid = process.message_uuid7.clone();
                             let worker = review_worker_shared.lock().unwrap().clone();
 
                             // LLM review can take up to ~10s and may time out.
