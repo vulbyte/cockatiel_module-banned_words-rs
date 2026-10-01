@@ -25,6 +25,7 @@
   ],
   "capabilities": "inprocess",
   "command_flags": [
+    "run",
     "--release"
   ],
   "credentials": [
@@ -78,7 +79,7 @@
     }
   ],
   "description": "in-process module that detects and censors banned words (no-spaces, leet, extra-spaces), optionally flags messages for review, and can run an optional LLM review (deberta/llama-guard) with a configurable risk threshold",
-  "launch_command": "cargo run",
+  "launch_command": "cargo",
   "min_rank": 0,
   "name": "banned-words",
   "price": 0,
