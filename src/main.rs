@@ -914,6 +914,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let config = config_shared.lock().unwrap().clone();
                             let original = process.processed_message.clone();
                             let uuid = process.message_uuid7.clone();
+                            if !uuid.is_empty() {
+                                let receipt = ContainerForEngine {
+                                    version: 2,
+                                    auth_token: auth_token.clone(),
+                                    module_name: module_name.clone(),
+                                    module_instance_uuid7: instance_uuid.clone(),
+                                    payload: Some(EnginePayload::MessageAck(MessageAck {
+                                        message_uuid7: uuid.clone(),
+                                    })),
+                                };
+                                let mut buf = Vec::new();
+                                if receipt.encode(&mut buf).is_ok() {
+                                    let mut w = write_shared.lock().await;
+                                    let _ = w.send(WsMessage::Binary(buf)).await;
+                                }
+                            }
                             let worker = review_worker_shared.lock().unwrap().clone();
 
                             // LLM review can take up to ~10s and may time out.
