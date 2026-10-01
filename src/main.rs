@@ -46,14 +46,14 @@ struct Config {
     llm_review: bool,
     /// The "risk certainty" (0–1): a review score >= this is treated as a hit.
     #[serde(default = "default_review_threshold")]
-    llm_review_threshold: f64,
+    llm_review_threshold: f32,
     /// "deberta" (default) | "llama-guard" | "auto" — both optional.
     #[serde(default = "default_review_engine")]
     llm_review_engine: String,
     /// Round-trip timeout for a single LLM review (request-write +
     /// response-read), in seconds.
     #[serde(default = "default_review_timeout_secs")]
-    review_timeout_secs: u64,
+    review_timeout_secs: u32,
     /// Interpreter used to launch the review worker.
     #[serde(default = "default_python_interpreter")]
     python_interpreter: String,
@@ -66,24 +66,24 @@ struct Config {
     prompt_timeout_secs: u32,
     /// Reconnect backoff floor (seconds) when the engine connection drops.
     #[serde(default = "default_reconnect_base_secs")]
-    reconnect_base_secs: u64,
+    reconnect_base_secs: u32,
     /// Reconnect backoff cap (seconds) after exponential growth.
     #[serde(default = "default_reconnect_max_secs")]
-    reconnect_max_secs: u64,
+    reconnect_max_secs: u32,
     /// Worker model overrides (defaults keep the built-in worker behavior).
     #[serde(default = "default_llama_model")]
     llama_model: String,
     #[serde(default = "default_deberta_model")]
     deberta_model: String,
     #[serde(default = "default_deberta_max_length")]
-    deberta_max_length: u64,
+    deberta_max_length: u32,
     #[serde(default = "default_llama_max_length")]
-    llama_max_length: u64,
+    llama_max_length: u32,
     #[serde(default = "default_llama_max_new_tokens")]
-    llama_max_new_tokens: u64,
+    llama_max_new_tokens: u32,
 }
 
-fn default_review_timeout_secs() -> u64 {
+fn default_review_timeout_secs() -> u32 {
     10
 }
 
@@ -99,11 +99,11 @@ fn default_prompt_timeout_secs() -> u32 {
     60
 }
 
-fn default_reconnect_base_secs() -> u64 {
+fn default_reconnect_base_secs() -> u32 {
     1
 }
 
-fn default_reconnect_max_secs() -> u64 {
+fn default_reconnect_max_secs() -> u32 {
     30
 }
 
@@ -115,15 +115,15 @@ fn default_deberta_model() -> String {
     "microsoft/deberta-v3-small".to_string()
 }
 
-fn default_deberta_max_length() -> u64 {
+fn default_deberta_max_length() -> u32 {
     256
 }
 
-fn default_llama_max_length() -> u64 {
+fn default_llama_max_length() -> u32 {
     2000
 }
 
-fn default_llama_max_new_tokens() -> u64 {
+fn default_llama_max_new_tokens() -> u32 {
     16
 }
 
@@ -135,7 +135,7 @@ fn default_sentence_mode() -> String {
     "none".to_string()
 }
 
-fn default_review_threshold() -> f64 {
+fn default_review_threshold() -> f32 {
     0.5
 }
 
@@ -285,15 +285,15 @@ fn censor_message(message: &str, banned: &[String], mode: &str, replace_word: &s
 struct ReviewWorker {
     enabled: bool,
     engine: String,
-    threshold: f64,
-    review_timeout_secs: u64,
+    threshold: f32,
+    review_timeout_secs: u32,
     python_interpreter: String,
     worker_script_path: String,
     llama_model: String,
     deberta_model: String,
-    deberta_max_length: u64,
-    llama_max_length: u64,
-    llama_max_new_tokens: u64,
+    deberta_max_length: u32,
+    llama_max_length: u32,
+    llama_max_new_tokens: u32,
     child: AsyncMutex<Option<ReviewChild>>,
     dead: Arc<AtomicBool>,
 }
@@ -309,7 +309,7 @@ struct ReviewChild {
 impl ReviewWorker {
     /// Settings (timeouts, interpreter, worker path, model overrides) are read
     /// from the module Config so operators can tune them without editing code.
-    fn new(enabled: bool, engine: String, threshold: f64, cfg: &Config) -> Self {
+    fn new(enabled: bool, engine: String, threshold: f32, cfg: &Config) -> Self {
         Self {
             enabled,
             engine,
@@ -342,7 +342,7 @@ impl ReviewWorker {
     /// abandoned request) is discarded, so a risk can never be mis-attributed
     /// to the wrong message. On timeout or worker error the child is killed and
     /// reaped; the next review spawns a fresh worker (reviving `dead`).
-    async fn review(&self, text: &str) -> Option<f64> {
+    async fn review(&self, text: &str) -> Option<f32> {
         if !self.enabled {
             return None;
         }
@@ -390,11 +390,11 @@ impl ReviewWorker {
                 if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
                     return Err(format!("worker error: {}", err));
                 }
-                return Ok(v.get("risk").and_then(|r| r.as_f64()));
+                return Ok(v.get("risk").and_then(|r| r.as_f64()).map(|f| f as f32));
             }
         };
 
-        match tokio::time::timeout(Duration::from_secs(self.review_timeout_secs), round_trip).await {
+        match tokio::time::timeout(Duration::from_secs(self.review_timeout_secs as u64), round_trip).await {
             Ok(Ok(Some(risk))) => Some(risk),
             Ok(Ok(None)) => None, // worker responded without a usable risk field
             Ok(Err(e)) => {
@@ -423,7 +423,7 @@ impl ReviewWorker {
 
     /// Whether this text should be treated as a hit given the configurable
     /// risk-certainty threshold.
-    fn is_hit(&self, risk: f64) -> bool {
+    fn is_hit(&self, risk: f32) -> bool {
         risk >= self.threshold
     }
 }
@@ -663,7 +663,7 @@ async fn prompt_for_input(
     }
     drop(guard);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout as u64 + 10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs((timeout + 10) as u64);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(10), prompt_rx.recv()).await {
             Ok(Some(resp)) if resp.prompt_id_uuid7 == prompt_id => {
@@ -986,7 +986,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let reconnect_cfg = config_shared.lock().unwrap().clone();
                 let mut backoff = reconnect_cfg.reconnect_base_secs;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(backoff)).await;
+                    tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
                     match CockatielClient::connect("banned_words.json").await {
                         Ok(conn) => {
                             info!("Reconnected to engine");
@@ -1121,7 +1121,7 @@ mod tests {
         }
     }
 
-    fn test_worker(enabled: bool, engine: &str, threshold: f64) -> ReviewWorker {
+    fn test_worker(enabled: bool, engine: &str, threshold: f32) -> ReviewWorker {
         ReviewWorker::new(enabled, engine.to_string(), threshold, &default_config())
     }
 
