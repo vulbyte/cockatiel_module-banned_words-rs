@@ -12,7 +12,8 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tracing::{info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use cockatiel_client::proto::container::Payload;
+use cockatiel_client::proto::container_for_engine::Payload as EnginePayload;
+use cockatiel_client::proto::container_for_module::Payload as ModulePayload;
 use cockatiel_client::proto::*;
 use cockatiel_client::{CockatielClient, PromptKind};
 
@@ -481,7 +482,7 @@ fn compose_rejected(
     ChatMessageRejected {
         message_uuid7: message_uuid7.to_string(),
         message: Some(chat.clone()),
-        processed_message: processed.to_string(),
+        processed_message: Some(processed.to_string()),
         reason: reason.to_string(),
         origin: "banned-words".to_string(),
     }
@@ -546,12 +547,12 @@ async fn process_message(
     // rejection clearly (reason + raw + processed) instead of an obscure log.
     if flagged && config.flag_for_review {
         let rej = compose_rejected(uuid, chat, &censored, &reason);
-        let log = Container {
-            version: 1,
+        let log = ContainerForEngine {
+            version: 2,
             auth_token: identity.auth.clone(),
             module_name: identity.module.clone(),
             module_instance_uuid7: identity.instance.clone(),
-            payload: Some(Payload::ChatMessageRejected(rej)),
+            payload: Some(EnginePayload::ChatMessageRejected(rej)),
         };
         let mut buf = Vec::new();
         if log.encode(&mut buf).is_ok() {
@@ -561,12 +562,12 @@ async fn process_message(
     }
 
     // Reply with the (possibly censored) message, same uuid → engine acks in_process.
-    let reply = Container {
-        version: 1,
+    let reply = ContainerForEngine {
+        version: 2,
         auth_token: identity.auth.clone(),
         module_name: identity.module.clone(),
         module_instance_uuid7: identity.instance.clone(),
-        payload: Some(Payload::MessageInProcess(MessageInProcess {
+        payload: Some(EnginePayload::MessageInProcess(MessageInProcess {
             message_uuid7: uuid.to_string(),
             raw_message: Some(ChatMessage {
                 platform: chat.platform.clone(),
@@ -645,12 +646,12 @@ async fn prompt_for_input(
         input_label: input_label.to_string(),
         prompt_type: prompt_type as i32,
     };
-    let container = Container {
-        version: 1,
+    let container = ContainerForEngine {
+        version: 2,
         auth_token: auth_token.to_string(),
         module_name: module_name.to_string(),
         module_instance_uuid7: instance_uuid.to_string(),
-        payload: Some(Payload::Prompt(prompt)),
+        payload: Some(EnginePayload::Prompt(prompt)),
     };
     let mut buf = Vec::new();
     if container.encode(&mut buf).is_err() {
@@ -881,20 +882,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                     };
-                    let Ok(container) = Container::decode(data.as_ref()) else { continue };
+                    let Ok(container) = ContainerForModule::decode(data.as_ref()) else { continue };
 
                     match container.payload {
-                        Some(Payload::AuthVerify(_)) => {
+                        Some(ModulePayload::AuthVerify(_)) => {
                             // Answer the engine's liveness probe (this module
                             // reads the socket directly, so the client's
                             // auto-answer is bypassed — without this the
                             // watchdog severs us).
-                            let reply = Container {
-                                version: 1,
+                            let reply = ContainerForEngine {
+                                version: 2,
                                 auth_token: auth_token.clone(),
                                 module_name: module_name.clone(),
                                 module_instance_uuid7: instance_uuid.clone(),
-                                payload: Some(Payload::AuthVerify(AuthVerify {
+                                payload: Some(EnginePayload::AuthVerify(AuthVerify {
                                     cur_auth: auth_token.clone(),
                                 })),
                             };
@@ -904,11 +905,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let _ = w.send(WsMessage::Binary(buf)).await;
                             }
                         }
-                        Some(Payload::PromptResponse(resp)) => {
+                        Some(ModulePayload::PromptResponse(resp)) => {
                             // Forward operator answers to the awaiting prompt.
                             let _ = prompt_tx_task.send(resp);
                         }
-                        Some(Payload::MessageInProcess(process)) => {
+                        Some(ModulePayload::MessageInProcess(process)) => {
                             let Some(chat) = &process.raw_message else { continue };
                             let config = config_shared.lock().unwrap().clone();
                             let original = process.processed_message.clone();
@@ -1199,7 +1200,7 @@ mod tests {
         assert_eq!(rej.message_uuid7, "uuid-9");
         assert_eq!(rej.origin, "banned-words");
         assert_eq!(rej.reason, "banned word 'x' via leet");
-        assert_eq!(rej.processed_message, "b*d*");
+        assert_eq!(rej.processed_message, Some("b*d*".to_string()));
         let raw = rej.message.unwrap();
         assert_eq!(raw.raw_message, "b4dx");
         assert_eq!(raw.platform, "twitch");
