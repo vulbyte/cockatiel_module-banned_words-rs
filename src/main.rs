@@ -164,6 +164,51 @@ fn strip_all_spaces(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace() && *c != '_').collect()
 }
 
+/// The text a module should operate on: the accumulated in-process text from
+/// earlier modules, falling back to the raw chat message only when that is
+/// empty. Censoring the raw message would discard earlier modules' edits.
+fn effective_text<'a>(chat_raw: &'a str, incoming: &'a str) -> &'a str {
+    if incoming.trim().is_empty() {
+        chat_raw
+    } else {
+        incoming
+    }
+}
+
+/// True when `word` occurs in the space/underscore-stripped `haystack` and the
+/// occurrence spans at least one stripped separator. This catches the
+/// "no-spaces" evasion ("b a d w o r d") without the substring false positive
+/// that flagged "ass" inside "class" or "hell" inside "hello".
+fn contains_split(haystack: &str, word: &str) -> bool {
+    // Each kept character paired with its byte index in the original text.
+    let kept: Vec<(char, usize)> = haystack
+        .char_indices()
+        .filter(|(_, c)| !c.is_whitespace() && *c != '_')
+        .map(|(i, c)| (c, i))
+        .collect();
+    let wchars: Vec<char> = word.chars().collect();
+    if wchars.is_empty() || kept.len() < wchars.len() {
+        return false;
+    }
+    for start in 0..=kept.len() - wchars.len() {
+        let run = &kept[start..start + wchars.len()];
+        if !run.iter().map(|(c, _)| *c).eq(wchars.iter().copied()) {
+            continue;
+        }
+        // A gap between consecutive kept chars means a separator was removed
+        // inside the match — the evasion we want to catch. A fully contiguous
+        // run is just a substring of one word, so it is not a hit.
+        for j in start..start + wchars.len() - 1 {
+            let (c, idx) = kept[j];
+            let (_, next_idx) = kept[j + 1];
+            if next_idx != idx + c.len_utf8() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Check if the message contains any banned word, across variants.
 /// Returns the first banned word matched and which variant it was.
 fn detect_banned(message: &str, banned: &[String]) -> Option<(String, &'static str)> {
@@ -184,13 +229,13 @@ fn detect_banned(message: &str, banned: &[String]) -> Option<(String, &'static s
                 return Some((w.clone(), "leet"));
             }
             let nospace = strip_all_spaces(token);
-            if nospace == w || nospace.contains(&w) {
+            if nospace == w {
                 return Some((w.clone(), "no-spaces"));
             }
         }
-        // Whole-message fallback: a space-stripped message containing the word.
-        let stripped = strip_all_spaces(&lowered);
-        if stripped.contains(&w) {
+        // Whole-message fallback: a banned word split across separators. A
+        // substring wholly inside one word is not a hit.
+        if contains_split(&lowered, &w) {
             return Some((w.clone(), "no-spaces"));
         }
     }
@@ -257,7 +302,6 @@ fn censor_message(message: &str, banned: &[String], mode: &str, replace_word: &s
             t == w
                 || leet_translate(&t) == w
                 || strip_all_spaces(&t) == w
-                || strip_all_spaces(&t).contains(&w)
         });
         if matched {
             result.push_str(&censor_token(token, mode, replace_word));
@@ -505,14 +549,17 @@ async fn process_message(
     config: &Config,
     worker: &Option<Arc<ReviewWorker>>,
     chat: &ChatMessage,
+    incoming: &str,
     uuid: &str,
     identity: &EngineIdentity,
     write_shared: &Arc<AsyncMutex<WsWriteHalf>>,
 ) {
-    let original = chat.raw_message.clone();
+    // Operate on the accumulated in-process text from earlier modules, not the
+    // raw message: censoring the raw message would revert their edits.
+    let original = effective_text(&chat.raw_message, incoming);
     let mut flagged = false;
     let mut reason = String::new();
-    match detect_banned(&original, &config.banned_words) {
+    match detect_banned(original, &config.banned_words) {
         Some((word, variant)) => {
             warn!("Banned word '{}' detected via {} variant", word, variant);
             flagged = true;
@@ -522,7 +569,7 @@ async fn process_message(
             // Optional LLM review: catch what the word list missed. Risk >= the
             // configurable certainty threshold is treated exactly like a hit.
             if let Some(w) = worker {
-                if let Some(risk) = w.review(&original).await {
+                if let Some(risk) = w.review(original).await {
                     if w.is_hit(risk) {
                         warn!("LLM review flagged message (risk={})", risk);
                         flagged = true;
@@ -538,9 +585,9 @@ async fn process_message(
     }
 
     let censored = if flagged {
-        apply_censor(config, &original)
+        apply_censor(config, original)
     } else {
-        original.clone()
+        original.to_string()
     };
 
     // If flag_for_review, send a ChatMessageRejected so the engine logs the
@@ -572,7 +619,7 @@ async fn process_message(
             raw_message: Some(ChatMessage {
                 platform: chat.platform.clone(),
                 raw_data: chat.raw_data.clone(),
-                raw_message: censored.clone(),
+                raw_message: chat.raw_message.clone(),
                 user_uuid7: chat.user_uuid7.clone(),
                 command: chat.command.clone(),
                 channel_id: chat.channel_id.clone(),
@@ -912,7 +959,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Some(ModulePayload::MessageInProcess(process)) => {
                             let Some(chat) = &process.raw_message else { continue };
                             let config = config_shared.lock().unwrap().clone();
-                            let original = process.processed_message.clone();
+                            // The accumulated in-process text from earlier
+                            // modules (e.g. language-constrainer); fall back to
+                            // the raw message only when it is empty.
+                            let incoming = process.processed_message.clone();
+                            let text = effective_text(&chat.raw_message, &incoming);
                             let uuid = process.message_uuid7.clone();
                             if !uuid.is_empty() {
                                 let receipt = ContainerForEngine {
@@ -940,23 +991,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // fast inline path.
                             if config.llm_review
                                 && worker.is_some()
-                                && detect_banned(&original, &config.banned_words).is_none()
+                                && detect_banned(text, &config.banned_words).is_none()
                             {
                                 let identity = EngineIdentity {
                                     auth: auth_token.clone(),
                                     module: module_name.clone(),
                                     instance: instance_uuid.clone(),
                                 };
-                                let (cfg, w, ch, u, idnt, ws) = (
+                                let (cfg, w, ch, inc, u, idnt, ws) = (
                                     config.clone(),
                                     worker.clone().unwrap(),
                                     chat.clone(),
+                                    incoming.clone(),
                                     uuid.clone(),
                                     identity,
                                     Arc::clone(&write_shared),
                                 );
                                 tokio::spawn(async move {
-                                    process_message(&cfg, &Some(w), &ch, &u, &idnt, &ws).await;
+                                    process_message(&cfg, &Some(w), &ch, &inc, &u, &idnt, &ws).await;
                                 });
                                 continue;
                             }
@@ -970,6 +1022,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &config,
                                 &worker,
                                 chat,
+                                &incoming,
                                 &uuid,
                                 &identity,
                                 &write_shared,
@@ -1077,6 +1130,55 @@ mod tests {
     #[test]
     fn clean_message_is_none() {
         assert!(detect_banned("hello friends", &banned()).is_none());
+    }
+
+    #[test]
+    fn substring_of_a_larger_word_is_not_flagged() {
+        // A banned "ass" must not flag "class"/"grass", nor "hell" flag "hello".
+        let list = vec!["ass".to_string(), "hell".to_string()];
+        assert!(detect_banned("class", &list).is_none());
+        assert!(detect_banned("grass", &list).is_none());
+        assert!(detect_banned("hello", &list).is_none());
+        assert!(detect_banned("a classic grassy hello", &list).is_none());
+    }
+
+    #[test]
+    fn standalone_and_leet_words_are_still_flagged() {
+        let list = vec!["ass".to_string(), "hell".to_string()];
+        assert!(detect_banned("ass", &list).is_some());
+        assert!(detect_banned("you ass", &list).is_some());
+        assert!(detect_banned("h3ll", &list).is_some());
+        assert!(detect_banned("go to h3ll", &list).is_some());
+    }
+
+    #[test]
+    fn substring_censor_does_not_touch_larger_words() {
+        let list = vec!["ass".to_string()];
+        assert_eq!(censor_message("class", &list, "hard", ""), "class");
+        assert_eq!(censor_message("grass is ass", &list, "hard", ""), "grass is ***");
+    }
+
+    #[test]
+    fn prior_in_process_edit_is_preserved_and_censored() {
+        // A prior module (language-constrainer) rewrote the message. banned_words
+        // must censor THAT text, not revert to the raw message.
+        let mut cfg = default_config();
+        cfg.banned_words = vec!["badword".to_string()];
+        cfg.censor_mode = "hard".to_string();
+        let incoming = "constrainer cleaned badword here";
+        let text = effective_text("raw original badword text", incoming);
+        assert_eq!(text, incoming, "the earlier edit must be preserved");
+        assert!(detect_banned(text, &cfg.banned_words).is_some());
+        assert_eq!(apply_censor(&cfg, text), "constrainer cleaned ******* here");
+    }
+
+    #[test]
+    fn empty_incoming_falls_back_to_raw() {
+        let mut cfg = default_config();
+        cfg.banned_words = vec!["badword".to_string()];
+        cfg.censor_mode = "hard".to_string();
+        assert_eq!(effective_text("raw badword", ""), "raw badword");
+        assert_eq!(apply_censor(&cfg, effective_text("raw badword", "")), "raw *******");
     }
 
     #[test]
