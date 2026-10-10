@@ -83,11 +83,11 @@
   "min_rank": 0,
   "name": "banned-words",
   "price": 0,
-  "root_file": "./src/main.rs",
-  "version": "0.2.0",
   "release": {
-    "repo": "vulbyte/cockatiel_module-banned_words-rs",
     "base_url": "https://github.com/vulbyte/cockatiel_module-banned_words-rs/releases/download",
+    "repo": "vulbyte/cockatiel_module-banned_words-rs",
     "tag": "v0.2.0"
-  }
+  },
+  "root_file": "./src/main.rs",
+  "version": "0.2.0"
 }
