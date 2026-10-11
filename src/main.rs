@@ -1,4 +1,3 @@
-
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -18,9 +17,7 @@ use cockatiel_client::proto::*;
 use cockatiel_client::{CockatielClient, PromptKind};
 
 type WsWriteHalf = futures_util::stream::SplitSink<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     WsMessage,
 >;
 
@@ -161,7 +158,9 @@ fn leet_translate(s: &str) -> String {
 
 /// Collapse whitespace and remove all spaces (for "no-spaces" / "extra-spaces" detection).
 fn strip_all_spaces(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace() && *c != '_').collect()
+    s.chars()
+        .filter(|c| !c.is_whitespace() && *c != '_')
+        .collect()
 }
 
 /// The text a module should operate on: the accumulated in-process text from
@@ -299,9 +298,7 @@ fn censor_message(message: &str, banned: &[String], mode: &str, replace_word: &s
                 return false;
             }
             let t = token.to_lowercase();
-            t == w
-                || leet_translate(&t) == w
-                || strip_all_spaces(&t) == w
+            t == w || leet_translate(&t) == w || strip_all_spaces(&t) == w
         });
         if matched {
             result.push_str(&censor_token(token, mode, replace_word));
@@ -400,7 +397,10 @@ impl ReviewWorker {
                     *guard = Some(c);
                 }
                 Err(e) => {
-                    warn!("llm_review: worker failed to start ({}); disabling review", e);
+                    warn!(
+                        "llm_review: worker failed to start ({}); disabling review",
+                        e
+                    );
                     self.dead.store(true, Ordering::SeqCst);
                     return None;
                 }
@@ -438,7 +438,12 @@ impl ReviewWorker {
             }
         };
 
-        match tokio::time::timeout(Duration::from_secs(self.review_timeout_secs as u64), round_trip).await {
+        match tokio::time::timeout(
+            Duration::from_secs(self.review_timeout_secs as u64),
+            round_trip,
+        )
+        .await
+        {
             Ok(Ok(Some(risk))) => Some(risk),
             Ok(Ok(None)) => None, // worker responded without a usable risk field
             Ok(Err(e)) => {
@@ -487,7 +492,9 @@ impl Drop for ReviewChild {
     }
 }
 
-async fn spawn_review_worker(worker: &ReviewWorker) -> Result<ReviewChild, Box<dyn std::error::Error>> {
+async fn spawn_review_worker(
+    worker: &ReviewWorker,
+) -> Result<ReviewChild, Box<dyn std::error::Error>> {
     let mut cmd = Command::new(&worker.python_interpreter);
     cmd.arg(&worker.worker_script_path)
         .arg("--engine")
@@ -529,6 +536,26 @@ fn compose_rejected(
         processed_message: Some(processed.to_string()),
         reason: reason.to_string(),
         origin: "banned-words".to_string(),
+    }
+}
+
+/// An empty command list registers this module as a catch-all, so the engine
+/// routes every message (including command messages like `!tts <text>`) here.
+fn catch_all_commands() -> Commands {
+    Commands {
+        commands: vec![],
+        alert_on_unknown_command: false,
+    }
+}
+
+async fn send_container(
+    write_shared: &Arc<AsyncMutex<WsWriteHalf>>,
+    container: ContainerForEngine,
+) {
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        let mut w = write_shared.lock().await;
+        let _ = w.send(WsMessage::Binary(buf)).await;
     }
 }
 
@@ -636,7 +663,10 @@ async fn process_message(
         let mut w = write_shared.lock().await;
         let _ = w.send(WsMessage::Binary(buf)).await;
         if flagged {
-            info!("Censored message ({}): {:?} -> {:?}", uuid, original, censored);
+            info!(
+                "Censored message ({}): {:?} -> {:?}",
+                uuid, original, censored
+            );
         }
     }
 }
@@ -649,13 +679,23 @@ fn apply_censor(config: &Config, original: &str) -> String {
         // Replace the whole message/sentence.
         "replace" => {
             if config.replace_sentence.is_empty() {
-                censor_message(original, &config.banned_words, &config.censor_mode, &config.replace_word)
+                censor_message(
+                    original,
+                    &config.banned_words,
+                    &config.censor_mode,
+                    &config.replace_word,
+                )
             } else {
                 config.replace_sentence.clone()
             }
         }
         // Default: censor only the offending token(s).
-        _ => censor_message(original, &config.banned_words, &config.censor_mode, &config.replace_word),
+        _ => censor_message(
+            original,
+            &config.banned_words,
+            &config.censor_mode,
+            &config.replace_word,
+        ),
     }
 }
 
@@ -915,6 +955,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut read = read;
         tokio::spawn(async move {
             'reconnect: loop {
+                // Register as a catch-all (empty command list) on every
+                // connect so command messages (e.g. `!tts <slur>`) reach the
+                // censor too, not just the owning command module.
+                send_container(
+                    &write_shared,
+                    ContainerForEngine {
+                        version: 2,
+                        auth_token: auth_token.clone(),
+                        module_name: module_name.clone(),
+                        module_instance_uuid7: instance_uuid.clone(),
+                        payload: Some(EnginePayload::Commands(catch_all_commands())),
+                    },
+                )
+                .await;
                 loop {
                     let Some(msg) = read.next().await else { break };
                     let data = match msg {
@@ -929,7 +983,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                     };
-                    let Ok(container) = ContainerForModule::decode(data.as_ref()) else { continue };
+                    let Ok(container) = ContainerForModule::decode(data.as_ref()) else {
+                        continue;
+                    };
 
                     match container.payload {
                         Some(ModulePayload::AuthVerify(_)) => {
@@ -957,7 +1013,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = prompt_tx_task.send(resp);
                         }
                         Some(ModulePayload::MessageInProcess(process)) => {
-                            let Some(chat) = &process.raw_message else { continue };
+                            let Some(chat) = &process.raw_message else {
+                                continue;
+                            };
                             let config = config_shared.lock().unwrap().clone();
                             // The accumulated in-process text from earlier
                             // modules (e.g. language-constrainer); fall back to
@@ -1008,7 +1066,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Arc::clone(&write_shared),
                                 );
                                 tokio::spawn(async move {
-                                    process_message(&cfg, &Some(w), &ch, &inc, &u, &idnt, &ws).await;
+                                    process_message(&cfg, &Some(w), &ch, &inc, &u, &idnt, &ws)
+                                        .await;
                                 });
                                 continue;
                             }
@@ -1104,6 +1163,13 @@ mod tests {
     }
 
     #[test]
+    fn catch_all_commands_is_empty_and_quiet() {
+        let c = catch_all_commands();
+        assert!(c.commands.is_empty());
+        assert!(!c.alert_on_unknown_command);
+    }
+
+    #[test]
     fn detects_exact_match() {
         let (w, variant) = detect_banned("you are a badword", &banned()).unwrap();
         assert_eq!(w, "badword");
@@ -1155,7 +1221,10 @@ mod tests {
     fn substring_censor_does_not_touch_larger_words() {
         let list = vec!["ass".to_string()];
         assert_eq!(censor_message("class", &list, "hard", ""), "class");
-        assert_eq!(censor_message("grass is ass", &list, "hard", ""), "grass is ***");
+        assert_eq!(
+            censor_message("grass is ass", &list, "hard", ""),
+            "grass is ***"
+        );
     }
 
     #[test]
@@ -1178,7 +1247,10 @@ mod tests {
         cfg.banned_words = vec!["badword".to_string()];
         cfg.censor_mode = "hard".to_string();
         assert_eq!(effective_text("raw badword", ""), "raw badword");
-        assert_eq!(apply_censor(&cfg, effective_text("raw badword", "")), "raw *******");
+        assert_eq!(
+            apply_censor(&cfg, effective_text("raw badword", "")),
+            "raw *******"
+        );
     }
 
     #[test]
@@ -1208,10 +1280,19 @@ mod tests {
     fn censor_message_multibyte_whitespace_delimiter_no_panic() {
         // U+3000 (ideographic space) and U+00A0 (no-break space) are accepted
         // by char::is_whitespace — byte-slicing them used to panic mid-char.
-        assert_eq!(censor_message("badword\u{3000}ok", &banned(), "hard", ""), "*******\u{3000}ok");
-        assert_eq!(censor_message("badword\u{00a0}ok", &banned(), "hard", ""), "*******\u{00a0}ok");
+        assert_eq!(
+            censor_message("badword\u{3000}ok", &banned(), "hard", ""),
+            "*******\u{3000}ok"
+        );
+        assert_eq!(
+            censor_message("badword\u{00a0}ok", &banned(), "hard", ""),
+            "*******\u{00a0}ok"
+        );
         // Trailing multi-byte whitespace must also survive.
-        assert_eq!(censor_message("badword\u{3000}", &banned(), "hard", ""), "*******\u{3000}");
+        assert_eq!(
+            censor_message("badword\u{3000}", &banned(), "hard", ""),
+            "*******\u{3000}"
+        );
     }
 
     fn cfg_with_review() -> Config {
