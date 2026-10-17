@@ -78,6 +78,17 @@ struct Config {
     llama_max_length: u32,
     #[serde(default = "default_llama_max_new_tokens")]
     llama_max_new_tokens: u32,
+    /// Enable the lightweight in-process AI risk model (seed lexicon + shape
+    /// signals). No Python, no model files, no network — just a 0-1 score.
+    #[serde(default)]
+    risk_model: bool,
+    /// Risk-certainty threshold (0-1): a score >= this is treated as a hit.
+    #[serde(default = "default_risk_threshold")]
+    risk_threshold: f32,
+}
+
+fn default_risk_threshold() -> f32 {
+    0.5
 }
 
 fn default_review_timeout_secs() -> u32 {
@@ -140,27 +151,66 @@ fn default_review_engine() -> String {
     "deberta".to_string()
 }
 
-/// Leet-speak translation table (common substitutions).
-fn leet_translate(s: &str) -> String {
-    s.chars()
-        .map(|c| match c.to_ascii_lowercase() {
-            '3' => 'e',
-            '4' | '@' => 'a',
-            '0' => 'o',
-            '1' | '!' => 'i',
-            '5' | '$' => 's',
-            '7' => 't',
-            'z' => 's',
-            other => other,
-        })
-        .collect()
+/// Normalise ONE character for matching: lowercase it, fold leet digits/symbols
+/// to their letter (`4`→`a`, `@`→`a`, `$`→`s`, …), and fold common Latin
+/// diacritics to the base letter (`ä`→`a`). This is what makes matching
+/// resilient to "weird capitalization", leet, and accents.
+fn fold(c: char) -> char {
+    let c = match c.to_lowercase().next().unwrap_or(c) {
+        '0' => 'o',
+        '1' => 'i',
+        '3' => 'e',
+        '4' => 'a',
+        '5' => 's',
+        '7' => 't',
+        '@' => 'a',
+        '$' => 's',
+        other => other,
+    };
+    // Common Latin diacritics → base letter. Not full Unicode normalisation —
+    // just the letters a streamer realistically sees.
+    match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
+        'ç' | 'ć' | 'č' => 'c',
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ę' | 'ě' => 'e',
+        'ì' | 'í' | 'î' | 'ï' | 'ī' => 'i',
+        'ñ' | 'ń' => 'n',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' | 'ū' => 'u',
+        'ý' | 'ÿ' => 'y',
+        'ß' => 's',
+        other => other,
+    }
 }
 
-/// Collapse whitespace and remove all spaces (for "no-spaces" / "extra-spaces" detection).
-fn strip_all_spaces(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_whitespace() && *c != '_')
-        .collect()
+/// A character is KEPT in the condensed form when, once folded, it is a letter
+/// or digit. Everything else (spaces, punctuation, symbols) is a separator and
+/// is dropped.
+fn kept(c: char) -> bool {
+    fold(c).is_alphanumeric()
+}
+
+/// A condensed view of a string: only the folded alphanumeric characters, in
+/// order, each paired with its BYTE RANGE in the original. The condensed text
+/// is what we match against; the spans let us censor the original in place and
+/// tell a whole token from a substring.
+struct Condensed {
+    text: String,
+    spans: Vec<(usize, usize)>,
+}
+
+/// Condense a string: lowercase + fold + drop every non-alphanumeric. `b a d w
+/// o r d`, `badword!`, `BÄDWORD`, and `b4dw0rd` all condense to `badword`.
+fn condense(s: &str) -> Condensed {
+    let mut text = String::new();
+    let mut spans = Vec::new();
+    for (i, ch) in s.char_indices() {
+        if kept(ch) {
+            text.push(fold(ch));
+            spans.push((i, i + ch.len_utf8()));
+        }
+    }
+    Condensed { text, spans }
 }
 
 /// The text a module should operate on: the accumulated in-process text from
@@ -174,71 +224,72 @@ fn effective_text<'a>(chat_raw: &'a str, incoming: &'a str) -> &'a str {
     }
 }
 
-/// True when `word` occurs in the space/underscore-stripped `haystack` and the
-/// occurrence spans at least one stripped separator. This catches the
-/// "no-spaces" evasion ("b a d w o r d") without the substring false positive
-/// that flagged "ass" inside "class" or "hell" inside "hello".
-fn contains_split(haystack: &str, word: &str) -> bool {
-    // Each kept character paired with its byte index in the original text.
-    let kept: Vec<(char, usize)> = haystack
-        .char_indices()
-        .filter(|(_, c)| !c.is_whitespace() && *c != '_')
-        .map(|(i, c)| (c, i))
-        .collect();
-    let wchars: Vec<char> = word.chars().collect();
-    if wchars.is_empty() || kept.len() < wchars.len() {
-        return false;
-    }
-    for start in 0..=kept.len() - wchars.len() {
-        let run = &kept[start..start + wchars.len()];
-        if !run.iter().map(|(c, _)| *c).eq(wchars.iter().copied()) {
-            continue;
-        }
-        // A gap between consecutive kept chars means a separator was removed
-        // inside the match — the evasion we want to catch. A fully contiguous
-        // run is just a substring of one word, so it is not a hit.
-        for j in start..start + wchars.len() - 1 {
-            let (c, idx) = kept[j];
-            let (_, next_idx) = kept[j + 1];
-            if next_idx != idx + c.len_utf8() {
-                return true;
-            }
+/// True when the condensed match of length `m` at condensed index `a` counts as
+/// a hit: it spans a dropped separator (the space/punctuation-split evasion), OR
+/// it is a whole token (bounded by separators/ends). A run sitting wholly inside
+/// a longer word ("ass" in "class") is NOT a hit.
+fn is_hit(msg: &str, c: &Condensed, a: usize, m: usize) -> bool {
+    // An internal gap = a separator was dropped between two matched characters.
+    for j in a..a + m - 1 {
+        if c.spans[j + 1].0 != c.spans[j].1 {
+            return true;
         }
     }
-    false
+    // Whole token: the characters just outside the match are separators or ends.
+    let before_ok = c.spans[a].0 == 0
+        || msg[..c.spans[a].0]
+            .chars()
+            .next_back()
+            .map_or(true, |ch| !kept(ch));
+    let last = a + m - 1;
+    let after_ok = c.spans[last].1 == msg.len()
+        || msg[c.spans[last].1..]
+            .chars()
+            .next()
+            .map_or(true, |ch| !kept(ch));
+    before_ok && after_ok
 }
 
-/// Check if the message contains any banned word, across variants.
-/// Returns the first banned word matched and which variant it was.
-fn detect_banned(message: &str, banned: &[String]) -> Option<(String, &'static str)> {
-    let lowered = message.to_lowercase();
+/// The first banned word whose condensed form appears in `msg` as a hit, or
+/// `None`. Words are tried in list order.
+fn hit_word(msg: &str, banned: &[String]) -> Option<String> {
+    let c = condense(msg);
+    let chars: Vec<char> = c.text.chars().collect();
+    let n = chars.len();
     for word in banned {
-        let w = word.to_lowercase();
-        if w.is_empty() {
+        let wchars: Vec<char> = condense(word).text.chars().collect();
+        let m = wchars.len();
+        if m == 0 || m > n {
             continue;
         }
-        // Token-level detection: for each whitespace-delimited token, compare
-        // the token (original, leet-translated, and space-stripped) to the word.
-        for token in lowered.split_whitespace() {
-            if token == w {
-                return Some((w.clone(), "exact"));
+        for a in 0..=n - m {
+            if chars[a..a + m] == wchars[..] && is_hit(msg, &c, a, m) {
+                return Some(word.clone());
             }
-            let leet = leet_translate(token);
-            if leet == w {
-                return Some((w.clone(), "leet"));
-            }
-            let nospace = strip_all_spaces(token);
-            if nospace == w {
-                return Some((w.clone(), "no-spaces"));
-            }
-        }
-        // Whole-message fallback: a banned word split across separators. A
-        // substring wholly inside one word is not a hit.
-        if contains_split(&lowered, &w) {
-            return Some((w.clone(), "no-spaces"));
         }
     }
     None
+}
+
+/// Why `msg` matched `word`: "exact" when a whitespace-delimited token is the
+/// word case-insensitively, else "normalized" (leet/split/accent). Logging only.
+fn match_variant(msg: &str, word: &str) -> &'static str {
+    let w = word.to_lowercase();
+    if msg.split_whitespace().any(|t| t.to_lowercase() == w) {
+        "exact"
+    } else {
+        "normalized"
+    }
+}
+
+/// Check if the message contains any banned word and return the first match
+/// together with why it matched. Matching is against the CONDENSED form (see
+/// [`condense`]), so it tolerates spacing, punctuation, leet and accents.
+fn detect_banned(message: &str, banned: &[String]) -> Option<(String, &'static str)> {
+    hit_word(message, banned).map(|w| {
+        let variant = match_variant(message, &w);
+        (w, variant)
+    })
 }
 
 /// Censor a single token (already known to contain a banned word).
@@ -280,43 +331,185 @@ fn censor_token(token: &str, mode: &str, replace_word: &str) -> String {
 /// Censor any token in the message that matches a banned word (any variant).
 /// Non-matching tokens are preserved exactly (including whitespace).
 fn censor_message(message: &str, banned: &[String], mode: &str, replace_word: &str) -> String {
-    let mut result = String::new();
-    let mut rest = message;
-    while !rest.is_empty() {
-        // Find the next whitespace-delimited token.
-        let mut end = rest.len();
-        for (i, ch) in rest.char_indices() {
-            if ch.is_whitespace() {
-                end = i;
+    let c = condense(message);
+    let chars: Vec<char> = c.text.chars().collect();
+    let n = chars.len();
+    let words: Vec<Vec<char>> = banned
+        .iter()
+        .map(|w| condense(w).text.chars().collect::<Vec<char>>())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() || n == 0 {
+        return message.to_string();
+    }
+    // Collect non-overlapping hit spans as BYTE ranges in the original.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let mut matched = false;
+        for wchars in &words {
+            let m = wchars.len();
+            if i + m <= n && chars[i..i + m] == wchars[..] && is_hit(message, &c, i, m) {
+                ranges.push((c.spans[i].0, c.spans[i + m - 1].1));
+                i += m;
+                matched = true;
                 break;
             }
         }
-        let (token, remainder) = rest.split_at(end);
-        let matched = banned.iter().any(|word| {
-            let w = word.to_lowercase();
-            if w.is_empty() {
-                return false;
-            }
-            let t = token.to_lowercase();
-            t == w || leet_translate(&t) == w || strip_all_spaces(&t) == w
-        });
-        if matched {
-            result.push_str(&censor_token(token, mode, replace_word));
-        } else {
-            result.push_str(token);
+        if !matched {
+            i += 1;
         }
-        rest = remainder;
-        // Preserve the delimiter (the split_at consumed it as part of remainder).
-        // Push the whole first char — a multi-byte whitespace (e.g. U+3000,
-        // U+00A0) must never be byte-sliced (that panics mid-char).
-        if !rest.is_empty() && end < message.len() {
-            if let Some(c) = rest.chars().next() {
-                result.push(c);
-                rest = &rest[c.len_utf8()..];
+    }
+    if ranges.is_empty() {
+        return message.to_string();
+    }
+    // Rebuild, censoring only the matched byte ranges; everything else (spaces,
+    // punctuation, case, accents) is preserved exactly.
+    let mut out = String::new();
+    let mut last = 0;
+    for (s, e) in ranges {
+        out.push_str(&message[last..s]);
+        out.push_str(&censor_token(&message[s..e], mode, replace_word));
+        last = e;
+    }
+    out.push_str(&message[last..]);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight in-process AI risk model
+// ---------------------------------------------------------------------------
+//
+// A tiny logistic regression over a built-in seed lexicon plus obfuscation /
+// shape signals. It returns a "risk" 0..1 in microseconds with NO Python, NO
+// model file and NO network — the operator enables it and sets a threshold.
+// This is intentionally small and explainable rather than a transformer.
+
+/// Built-in seed lexicon (folded). Deliberately modest and generic — common
+/// profanity/insults, no slurs. It exists so the model catches shapes the
+/// operator's own `banned_words` list may miss. Tune freely.
+const RISK_SEED: &[&str] = &[
+    "idiot", "stupid", "moron", "dumbass", "dumb", "loser", "trash", "garbage",
+    "scumbag", "shutup", "hateyou", "killyourself", "kys", "worthless", "pathetic",
+    "freak", "noob", "fuck", "fucking", "shit", "asshole", "bastard", "bitch",
+    "dick", "wtf", "stfu",
+];
+
+/// How many seed words a message hits (folded matching, same rules as the
+/// censor: whole token or spans a separator).
+fn risk_lexicon_hits(text: &str) -> usize {
+    let c = condense(text);
+    let chars: Vec<char> = c.text.chars().collect();
+    let n = chars.len();
+    let mut hits = 0;
+    for word in RISK_SEED {
+        let wchars: Vec<char> = condense(word).text.chars().collect();
+        let m = wchars.len();
+        if m == 0 || m > n {
+            continue;
+        }
+        for a in 0..=n - m {
+            if chars[a..a + m] == wchars[..] && is_hit(text, &c, a, m) {
+                hits += 1;
+                break;
             }
         }
     }
-    result
+    hits
+}
+
+/// The interpretable signals the model regresses on.
+struct RiskFeatures {
+    /// Saturating lexicon signal: 0 with no seed hit, approaching 1 with several.
+    lexicon: f32,
+    /// Obfuscation density: separators tucked inside a word + leet-folded chars.
+    obfuscation: f32,
+    /// Shouting: uppercase share of letters.
+    caps: f32,
+    /// Stretch: share of characters sitting in a run of >= 3 identical chars.
+    repetition: f32,
+    /// Symbol dust: share of non-alphanumeric, non-space characters.
+    symbols: f32,
+    /// Length, saturating at ~200 chars.
+    length: f32,
+}
+
+fn risk_features(text: &str) -> RiskFeatures {
+    let total = text.chars().count().max(1);
+    let letters = text.chars().filter(|c| c.is_alphabetic()).count();
+    let upper = text.chars().filter(|c| c.is_uppercase()).count();
+    let symbols = text
+        .chars()
+        .filter(|c| !c.is_alphanumeric() && !c.is_whitespace())
+        .count();
+    let leet = text
+        .chars()
+        .filter(|c| fold(*c) != c.to_ascii_lowercase())
+        .count();
+
+    // A separator tucked between letters of the SAME run ("b.a.d") is the
+    // obfuscation we care about; whitespace ends the run (a normal word gap).
+    let mut tucked = 0usize;
+    let mut in_run = false;
+    for ch in text.chars() {
+        if ch.is_alphabetic() {
+            in_run = true;
+        } else if ch.is_whitespace() {
+            in_run = false;
+        } else if in_run {
+            tucked += 1;
+        }
+    }
+
+    let mut repetition = 0usize;
+    let mut prev = '\0';
+    let mut run = 0usize;
+    for ch in text.chars() {
+        if ch == prev {
+            run += 1;
+        } else {
+            prev = ch;
+            run = 1;
+        }
+        if run >= 3 {
+            repetition += 1;
+        }
+    }
+
+    RiskFeatures {
+        lexicon: 1.0 - (-(risk_lexicon_hits(text) as f32)).exp(),
+        obfuscation: ((tucked + leet) as f32 / total as f32).min(1.0),
+        caps: if letters > 0 {
+            upper as f32 / letters as f32
+        } else {
+            0.0
+        },
+        repetition: (repetition as f32 / total as f32).min(1.0),
+        symbols: (symbols as f32 / total as f32).min(1.0),
+        length: (total as f32 / 200.0).min(1.0),
+    }
+}
+
+// Logistic weights (hand-tuned; the model is a plain linear classifier).
+const RISK_W_LEXICON: f32 = 6.0;
+const RISK_W_OBFUSCATION: f32 = 3.0;
+const RISK_W_CAPS: f32 = 0.5;
+const RISK_W_REPETITION: f32 = 2.0;
+const RISK_W_SYMBOLS: f32 = 1.0;
+const RISK_W_LENGTH: f32 = 0.5;
+const RISK_BIAS: f32 = -3.0;
+
+/// Score a message 0..1 for "risk". Fast, local, and dependency-free.
+fn risk_score(text: &str) -> f32 {
+    let f = risk_features(text);
+    let z = RISK_BIAS
+        + RISK_W_LEXICON * f.lexicon
+        + RISK_W_OBFUSCATION * f.obfuscation
+        + RISK_W_CAPS * f.caps
+        + RISK_W_REPETITION * f.repetition
+        + RISK_W_SYMBOLS * f.symbols
+        + RISK_W_LENGTH * f.length;
+    1.0 / (1.0 + (-z).exp())
 }
 
 /// Optional LLM review backend. Spawns `worker/review_worker.py` lazily (only
@@ -592,23 +785,34 @@ async fn process_message(
             flagged = true;
             reason = format!("banned word '{}' via {} variant", word, variant);
         }
-        None if config.llm_review => {
-            // Optional LLM review: catch what the word list missed. Risk >= the
-            // configurable certainty threshold is treated exactly like a hit.
-            if let Some(w) = worker {
-                if let Some(risk) = w.review(original).await {
-                    if w.is_hit(risk) {
-                        warn!("LLM review flagged message (risk={})", risk);
-                        flagged = true;
-                        reason = format!(
-                            "LLM risk {} >= threshold {}",
-                            risk, config.llm_review_threshold
-                        );
+        None => {
+            // Lightweight in-process AI risk model: fast, local, no Python or
+            // model files. A risk >= the configurable threshold is a hit.
+            if config.risk_model {
+                let risk = risk_score(original);
+                if risk >= config.risk_threshold {
+                    warn!("Risk model flagged message (risk={:.3})", risk);
+                    flagged = true;
+                    reason = format!("risk {:.3} >= threshold {}", risk, config.risk_threshold);
+                }
+            }
+            // Optional heavier LLM review (Python worker): catch what the word
+            // list AND the risk model missed. Only if not already flagged.
+            if !flagged && config.llm_review {
+                if let Some(w) = worker {
+                    if let Some(risk) = w.review(original).await {
+                        if w.is_hit(risk) {
+                            warn!("LLM review flagged message (risk={})", risk);
+                            flagged = true;
+                            reason = format!(
+                                "LLM risk {} >= threshold {}",
+                                risk, config.llm_review_threshold
+                            );
+                        }
                     }
                 }
             }
         }
-        _ => {}
     }
 
     let censored = if flagged {
@@ -818,6 +1022,8 @@ fn default_config() -> Config {
         deberta_max_length: default_deberta_max_length(),
         llama_max_length: default_llama_max_length(),
         llama_max_new_tokens: default_llama_max_new_tokens(),
+        risk_model: false,
+        risk_threshold: default_risk_threshold(),
     }
 }
 
@@ -902,6 +1108,8 @@ async fn load_config(
         deberta_max_length: default.deberta_max_length,
         llama_max_length: default.llama_max_length,
         llama_max_new_tokens: default.llama_max_new_tokens,
+        risk_model: default.risk_model,
+        risk_threshold: default.risk_threshold,
     };
 
     save_config(&config);
@@ -1423,5 +1631,270 @@ mod tests {
         cfg.replace_sentence = String::new();
         cfg.censor_mode = "hard".to_string();
         assert_eq!(apply_censor(&cfg, "badword is a word"), "******* is a word");
+    }
+}
+
+/// Table-driven coverage of banned_words' censorship: detection variants, the
+/// per-token censor modes (soft/hard/mid/replace), the whole-message "sentence"
+/// modes (replace message / censor message), and the replace-word /
+/// replace-sentence paths. ADD A ROW to a table to add a case — that is the
+/// point: dozens of cases, one line each.
+#[cfg(test)]
+mod censor_matrix {
+    use super::*;
+
+    fn list(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A config with only the censor-relevant fields set; everything else is the
+    /// module default.
+    fn cfg(
+        banned: &[&str],
+        censor_mode: &str,
+        replace_word: &str,
+        sentence_mode: &str,
+        replace_sentence: &str,
+    ) -> Config {
+        Config {
+            banned_words: list(banned),
+            censor_mode: censor_mode.to_string(),
+            replace_word: replace_word.to_string(),
+            sentence_mode: sentence_mode.to_string(),
+            replace_sentence: replace_sentence.to_string(),
+            ..default_config()
+        }
+    }
+
+    /// Detection variants: token exact / leet / no-spaces, and the whole-message
+    /// split fallback.
+    #[test]
+    fn detection_variants() {
+        // (label, message, banned, expected (word, variant) | None)
+        let cases: Vec<(&str, &str, Vec<&str>, Option<(&str, &str)>)> = vec![
+            ("clean", "hello friends", vec!["badword"], None),
+            ("exact", "you are a badword", vec!["badword"], Some(("badword", "exact"))),
+            ("upper", "BADWORD", vec!["badword"], Some(("badword", "exact"))),
+            ("mixed-case", "BaDwOrD", vec!["badword"], Some(("badword", "exact"))),
+            ("leet-digits", "b4dw0rd", vec!["badword"], Some(("badword", "normalized"))),
+            ("leet-symbols", "b@dw0rd", vec!["badword"], Some(("badword", "normalized"))),
+            ("split-spaces", "b a d w o r d", vec!["badword"], Some(("badword", "normalized"))),
+            ("split-underscores", "b_a_d_w_o_r_d", vec!["badword"], Some(("badword", "normalized"))),
+            ("substring-class", "class", vec!["ass"], None),
+            ("substring-grass", "grass", vec!["ass"], None),
+            ("substring-hello", "hello", vec!["hell"], None),
+            ("standalone-short-word", "you ass", vec!["ass"], Some(("ass", "exact"))),
+            ("leet-hell", "go to h3ll", vec!["hell"], Some(("hell", "normalized"))),
+            ("empty-message", "", vec!["badword"], None),
+            ("empty-word-is-skipped", "anything at all", vec![""], None),
+            ("first-of-many-wins", "shoot the badword", vec!["shoot", "badword"], Some(("shoot", "exact"))),
+        ];
+        for (label, msg, banned, expect) in cases {
+            let got = detect_banned(msg, &list(&banned));
+            match expect {
+                None => assert!(got.is_none(), "[{label}] expected nothing, got {got:?}"),
+                Some((w, v)) => {
+                    let (gw, gv) =
+                        got.unwrap_or_else(|| panic!("[{label}] expected {w}/{v}, got None"));
+                    assert_eq!((gw.as_str(), gv), (w, v), "[{label}]");
+                }
+            }
+        }
+    }
+
+    /// Per-token censor modes ("censor word"): soft / hard / mid / replace, plus
+    /// the length edges and the unknown-mode fallback.
+    #[test]
+    fn per_token_modes() {
+        // (label, token, mode, replace_word, expected)
+        let cases: Vec<(&str, &str, &str, &str, &str)> = vec![
+            ("soft-7", "badword", "soft", "", "b*****d"),
+            ("soft-3", "abc", "soft", "", "a*c"),
+            ("soft-2", "ab", "soft", "", "**"),
+            ("soft-1", "a", "soft", "", "*"),
+            ("soft-keeps-case", "BaDwOrD", "soft", "", "B*****D"),
+            ("hard-7", "badword", "hard", "", "*******"),
+            ("hard-1", "a", "hard", "", "*"),
+            ("mid-7", "badword", "mid", "", "b******"),
+            ("mid-1", "a", "mid", "", "a"),
+            ("replace-with-word", "badword", "replace", "heck", "heck"),
+            ("replace-empty-stars", "badword", "replace", "", "*******"),
+            ("unknown-mode-falls-back-to-soft", "badword", "bogus", "", "b*****d"),
+        ];
+        for (label, tok, mode, rep, want) in cases {
+            assert_eq!(censor_token(tok, mode, rep), *want, "[{label}]");
+        }
+    }
+
+    /// Token censoring inside a message: only matching tokens change; whitespace
+    /// and non-matching text survive exactly.
+    #[test]
+    fn token_censoring_in_messages() {
+        // (label, message, banned, mode, replace_word, expected)
+        let cases: Vec<(&str, &str, Vec<&str>, &str, &str, &str)> = vec![
+            ("only-matching-token", "badword is a word", vec!["badword"], "hard", "", "******* is a word"),
+            ("no-false-substring", "grass is ass", vec!["ass"], "hard", "", "grass is ***"),
+            ("double-space-preserved", "badword  badword", vec!["badword"], "soft", "", "b*****d  b*****d"),
+            ("leading-space", "  badword", vec!["badword"], "hard", "", "  *******"),
+            ("trailing-space", "badword  ", vec!["badword"], "hard", "", "*******  "),
+            ("leet-token", "b4dw0rd ok", vec!["badword"], "hard", "", "******* ok"),
+            ("clean-untouched", "clean text here", vec!["badword"], "hard", "", "clean text here"),
+            ("multiple-banned", "badword and shoot", vec!["badword", "shoot"], "hard", "", "******* and *****"),
+            ("multibyte-space-delimiter", "badword\u{3000}ok", vec!["badword"], "hard", "", "*******\u{3000}ok"),
+        ];
+        for (label, msg, banned, mode, rep, want) in cases {
+            assert_eq!(censor_message(msg, &list(&banned), mode, rep), *want, "[{label}]");
+        }
+    }
+
+    /// "Replace word": every matching token becomes the same replacement; note a
+    /// repeat is replaced each time (not collapsed).
+    #[test]
+    fn replace_word_cases() {
+        // (label, message, banned, replace_word, expected)
+        let cases: Vec<(&str, &str, Vec<&str>, &str, &str)> = vec![
+            ("single", "badword", vec!["badword"], "heck", "heck"),
+            ("repeat-each-time", "badword and badword", vec!["badword"], "heck", "heck and heck"),
+            ("two-different-banned", "badword and shoot", vec!["badword", "shoot"], "[redacted]", "[redacted] and [redacted]"),
+            ("non-matching-preserved", "clean badword text", vec!["badword"], "X", "clean X text"),
+            ("empty-replacement-stars", "badword", vec!["badword"], "", "*******"),
+        ];
+        for (label, msg, banned, rep, want) in cases {
+            let c = cfg(&banned, "replace", rep, "none", "");
+            assert_eq!(apply_censor(&c, msg), *want, "[{label}]");
+        }
+    }
+
+    /// "Replace message" / whole-sentence modes, and the token fallback.
+    #[test]
+    fn sentence_mode_cases() {
+        let msg = "a badword here";
+        let cases: Vec<(&str, Config, &str, String)> = vec![
+            ("token-default", cfg(&["badword"], "hard", "", "none", ""), msg, "a ******* here".to_string()),
+            ("sentence-censor", cfg(&["badword"], "hard", "", "censor", ""), msg, "*".repeat(msg.chars().count())),
+            ("sentence-replace", cfg(&["badword"], "hard", "", "replace", "[removed]"), msg, "[removed]".to_string()),
+            ("sentence-replace-fallback-to-token", cfg(&["badword"], "soft", "", "replace", ""), msg, "a b*****d here".to_string()),
+            ("sentence-censor-counts-chars-not-bytes", cfg(&["badword"], "hard", "", "censor", ""), "bäd word", "*".repeat("bäd word".chars().count())),
+        ];
+        for (label, c, input, want) in cases {
+            assert_eq!(apply_censor(&c, input), want, "[{label}]");
+        }
+    }
+
+    /// effective_text: an earlier module's edit wins; only empty/whitespace
+    /// incoming falls back to the raw message.
+    #[test]
+    fn effective_text_cases() {
+        // (label, raw, incoming, expected)
+        let cases: Vec<(&str, &str, &str, &str)> = vec![
+            ("incoming-wins", "raw badword", "cleaned text", "cleaned text"),
+            ("empty-incoming-falls-back", "raw badword", "", "raw badword"),
+            ("whitespace-incoming-falls-back", "raw badword", "   ", "raw badword"),
+            ("both-empty", "", "", ""),
+        ];
+        for (label, raw, incoming, want) in cases {
+            assert_eq!(effective_text(raw, incoming), want, "[{label}]");
+        }
+    }
+
+    /// The evasions the CONDENSED matcher now catches: attached punctuation,
+    /// leet symbols, accents, and non-space separators — the bypasses the old
+    /// token-exact matcher missed.
+    #[test]
+    fn evasions_are_caught() {
+        let bad = list(&["badword"]);
+
+        for (label, msg) in [
+            ("trailing-bang", "badword!"),
+            ("leading-bang", "!badword"),
+            ("punctuation-inside", "bad-word"),
+            ("dots-between", "b.a.d.w.o.r.d"),
+            ("spaces-between", "b a d w o r d"),
+            ("underscores-between", "b_a_d_w_o_r_d"),
+            ("uppercase", "BADWORD"),
+            ("leet-digits", "b4dw0rd"),
+            ("leet-at", "b@dw0rd"),
+            ("accented", "bädword"),
+            ("quoted", "\"badword\""),
+        ] {
+            assert!(
+                detect_banned(msg, &bad).is_some(),
+                "[{label}] {msg:?} should be caught"
+            );
+        }
+
+        // Censoring matches too: the offending span becomes stars, the
+        // surrounding punctuation survives untouched.
+        assert_eq!(censor_message("badword!", &bad, "hard", ""), "*******!");
+        assert_eq!(censor_message("!badword", &bad, "hard", ""), "!*******");
+        assert_eq!(censor_message("\"badword\"", &bad, "hard", ""), "\"*******\"");
+        assert_eq!(censor_message("b.a.d.w.o.r.d", &bad, "hard", ""), "*************");
+        assert_eq!(censor_message("BÄDWORD", &bad, "hard", ""), "*******");
+
+        // Guard: a real substring inside a longer word is still NOT caught.
+        for word in ["class", "grass", "hello", "a classic grassy hello"] {
+            assert!(
+                detect_banned(word, &list(&["ass", "hell"])).is_none(),
+                "{word:?} must not be flagged"
+            );
+        }
+    }
+}
+
+/// The lightweight AI risk model: a table of (label, text, high?) cases. The
+/// score is 0..1; "high" means it should clear a 0.5 threshold.
+#[cfg(test)]
+mod risk_model_tests {
+    use super::*;
+
+    #[test]
+    fn risk_score_is_in_range_and_sensible() {
+        // (label, text, expect_high)
+        let cases: Vec<(&str, &str, bool)> = vec![
+            ("empty", "", false),
+            ("whitespace", "   ", false),
+            ("greeting", "hello everyone, how are you?", false),
+            ("small talk", "good game well played", false),
+            ("thanks", "thanks for the stream, love it", false),
+            ("punct only", "!!???...", false),
+            ("toxic-insult", "you are a stupid idiot", true),
+            ("toxic-shutup", "shut up moron", true),
+            ("toxic-loser", "what a loser", true),
+            ("toxic-kys", "kys", true),
+            ("obf-spaced", "s t u p i d", true),
+            ("obf-caps", "STUPID!!!", true),
+            ("obf-punct", "idiot.", true),
+            ("obf-leet", "m0r0n", true),
+            ("obf-dots", "i.d.i.o.t", true),
+        ];
+        for (label, text, high) in cases {
+            let r = risk_score(text);
+            assert!(
+                (0.0..=1.0).contains(&r),
+                "[{label}] {text:?} scored {r}, out of 0..1"
+            );
+            if high {
+                assert!(r >= 0.5, "[{label}] {text:?} scored {r}, expected high (>=0.5)");
+            } else {
+                assert!(r < 0.3, "[{label}] {text:?} scored {r}, expected low (<0.3)");
+            }
+        }
+    }
+
+    /// More seed hits → higher risk (monotonic in the lexicon signal).
+    #[test]
+    fn more_toxicity_scores_higher() {
+        let one = risk_score("idiot");
+        let two = risk_score("idiot moron");
+        assert!(two > one, "two insults ({two}) should outscore one ({one})");
+        assert!(risk_score("you stupid fucking idiot") >= two);
+    }
+
+    /// The model is a pure function: same input, same output, no state.
+    #[test]
+    fn deterministic() {
+        for t in ["hello", "you idiot", "s t u p i d", ""] {
+            assert_eq!(risk_score(t), risk_score(t));
+        }
     }
 }
