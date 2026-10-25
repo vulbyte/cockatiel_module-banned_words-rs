@@ -76,6 +76,18 @@
       "label": "HuggingFace token (for llama-guard)",
       "list": false,
       "sensitive": true
+    },
+    {
+      "key": "data_dir",
+      "label": "Data directory",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "bans_path",
+      "label": "Bans file (bans.json)",
+      "list": false,
+      "sensitive": false
     }
   ],
   "description": "in-process module that detects and censors banned words (no-spaces, leet, extra-spaces), optionally flags messages for review, and can run an optional LLM review (deberta/llama-guard) with a configurable risk threshold",
